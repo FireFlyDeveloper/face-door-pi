@@ -395,10 +395,11 @@ class FaceDoorSystem:
             result = self.liveness.check_liveness(self._liveness_frames)
             score = result['score']
             blink_s = result.get('blink_score', 0)
-            texture_s = result.get('texture_score', 0)
-            flow_s = result.get('flow_score', 0)
+            head_pose_s = result.get('head_pose_score', 0)
+            head_trans_s = result.get('head_trans_score', 0)
+            head_s = result.get('head_score', 0)
             details = result.get('details', '')
-            print(f"[Main]   Blink={blink_s:.2f}  Texture={texture_s:.2f}  Flow={flow_s:.2f}  Combined={score:.2f}")
+            print(f"[Main]   Blink={blink_s:.2f}  HeadPose={head_pose_s:.2f}  HeadTrans={head_trans_s:.2f}  Combined={score:.2f}")
             if result['passed']:
                 print(f"[Main] Liveness PASSED (score={score:.3f})")
                 self._show_preview(self._latest_frame, "LIVENESS PASSED ✅",

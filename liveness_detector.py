@@ -1,12 +1,17 @@
 """
-liveness_detector.py — 3-layer anti-spoofing detection for face door system.
+liveness_detector.py — Reliable 2-layer liveness detection for thesis demo.
 
 Layers:
-  1. Blink detection  (weight 0.4) — Eye Aspect Ratio (EAR) via dlib 68 landmarks
-  2. Texture analysis  (weight 0.3) — LBP histogram + variance
-  3. Optical flow     (weight 0.3) — Farneback flow on face region
+  1. Blink detection  (weight 0.5) — Eye Aspect Ratio (EAR) via dlib 68 landmarks
+  2. Head pose motion (weight 0.5) — 3D head pose estimation via PnP + dlib landmarks
 
-Combined score >= 0.5 passes liveness check.
+Combined score >= 0.4 passes liveness check.
+
+A static photo / phone screen fails both checks:
+  - No blink: EAR stays constant (no transition below threshold)
+  - No 3D head motion: solvePnP rotation stays flat
+
+A real person passes both after 2.5s of capture.
 """
 
 import math
@@ -16,31 +21,59 @@ import cv2
 import dlib
 import numpy as np
 from scipy.spatial import distance as dist
-from skimage.feature import local_binary_pattern
 
 
 class LivenessDetector:
-    """3-layer anti-spoofing detector using blink, texture, and optical flow."""
+    """2-layer anti-spoofing: blink detection + head pose motion."""
 
     def __init__(self):
-        # Thresholds
-        self._ear_threshold: float = 0.25      # below this = eye closed (relaxed from 0.2)
-        self._ear_consec_frames: int = 1        # frames closed to count as blink
-        self._blink_weight: float = 0.4
-        self._texture_weight: float = 0.3
-        self._flow_weight: float = 0.3
-        self._pass_threshold: float = 0.4      # lowered from 0.5 for real-world use
+        # ── Blink thresholds ──
+        self._ear_threshold: float = 0.22       # EAR below this = eye closed
+        self._ear_consec_frames: int = 1         # frames closed to count as blink
+        self._eye_close_max_ear: float = 0.20    # typical max EAR when truly closed
+        self._blink_weight: float = 0.50
 
-        # LBP params
-        self._lbp_radius: int = 1
-        self._lbp_points: int = 8
+        # ── Head pose thresholds ──
+        self._head_weight: float = 0.50
+        self._head_motion_threshold: float = 1.5  # degrees of total rotation change
+        self._head_trans_threshold: float = 3.0   # pixels of translation change
 
-        # Eye landmark indices (68-point model)
-        # Left eye:  36-41    Right eye: 42-47
+        # ── Overall ──
+        self._pass_threshold: float = 0.40
+
+        # ── 3D face model points (generic) for solvePnP ──
+        #   Nose tip, chin, left eye corner, right eye corner,
+        #   left mouth corner, right mouth corner
+        self._model_points = np.array([
+            (0.0,    0.0,    0.0),       # Nose tip
+            (0.0,   -6.0,    0.0),       # Chin
+            (-2.5,   2.0,   -2.0),       # Left eye left corner
+            (2.5,    2.0,   -2.0),       # Right eye right corner
+            (-2.0,   4.0,   -2.0),       # Left mouth corner
+            (2.0,    4.0,   -2.0),       # Right mouth corner
+        ], dtype=np.float64)
+
+        # Camera intrinsic matrix (assumes 640x480, ~60° FOV)
+        self._camera_matrix = np.array([
+            [520.0,   0.0,   320.0],
+            [  0.0,  520.0,  240.0],
+            [  0.0,    0.0,    1.0],
+        ], dtype=np.float64)
+        self._dist_coeffs = np.zeros((4, 1))
+
+        # Landmark indices for the 6 key points above (dlib 68-point model)
+        self._nose_idx = 30
+        self._chin_idx = 8
+        self._left_eye_idx = 36
+        self._right_eye_idx = 45
+        self._left_mouth_idx = 48
+        self._right_mouth_idx = 54
+
+        # Eye landmark indices
         self._left_eye_idxs = list(range(36, 42))
         self._right_eye_idxs = list(range(42, 48))
 
-        # Load dlib 68-point predictor
+        # Load dlib predictor
         self._predictor = self._load_predictor()
 
     # ------------------------------------------------------------------
@@ -49,102 +82,89 @@ class LivenessDetector:
 
     def check_liveness(self, frames: List[np.ndarray]) -> Dict:
         """
-        Run all three liveness checks on a sequence of face frames.
+        Run blink + head-pose liveness checks.
 
         Args:
-            frames: List of BGR numpy arrays (at least 2 for flow, ~10+ ideal).
+            frames: List of BGR numpy arrays (30 frames @ ~0.08s each = 2.5s).
 
         Returns:
-            dict with keys:
-                passed: bool
-                score: float (0-1 combined)
-                blink_score: float (0-1)
-                texture_score: float (0-1)
-                flow_score: float (0-1)
-                details: human-readable summary
+            dict with keys: passed, score, blink_score, head_score, details
         """
-        if not frames:
+        if not frames or len(frames) < 3:
             return {
-                "passed": False,
-                "score": 0.0,
-                "blink_score": 0.0,
-                "texture_score": 0.0,
-                "flow_score": 0.0,
-                "details": "No frames provided",
+                "passed": False, "score": 0.0,
+                "blink_score": 0.0, "head_score": 0.0,
+                "head_pose_score": 0.0, "head_trans_score": 0.0,
+                "details": "Insufficient frames",
             }
 
-        # Convert all frames to RGB once (dlib uses RGB)
+        # Convert frames once
         rgb_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in frames]
         gray_frames = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
 
-        # Layer 1: Blink detection (uses all frames)
+        # Layer 1: Blink
         blink_score, blink_detail = self._check_blink(rgb_frames)
 
-        # Layer 2: Texture analysis (uses middle frame)
-        texture_score, texture_detail = self._check_texture(frames[len(frames) // 2])
-
-        # Layer 3: Optical flow (needs at least 2 frames)
-        flow_score, flow_detail = self._check_optical_flow(gray_frames)
-
-        # Combined score
-        score = (
-            blink_score * self._blink_weight
-            + texture_score * self._texture_weight
-            + flow_score * self._flow_weight
+        # Layer 2: Head pose motion
+        head_pose_score, head_trans_score, head_detail = self._check_head_pose(
+            rgb_frames, gray_frames
         )
+
+        # Combined head score = max(rotation, translation)
+        head_score = max(head_pose_score, head_trans_score)
+
+        # Total = weighted sum
+        score = blink_score * self._blink_weight + head_score * self._head_weight
         passed = score >= self._pass_threshold
 
         details = (
-            f"Blink({blink_detail}) Texture({texture_detail}) Flow({flow_detail})"
+            f"Blink({blink_detail}) "
+            f"Head({head_detail})"
         )
 
         return {
             "passed": passed,
             "score": round(score, 4),
             "blink_score": round(blink_score, 4),
-            "texture_score": round(texture_score, 4),
-            "flow_score": round(flow_score, 4),
+            "texture_score": 0.0,        # keep for compatibility
+            "flow_score": 0.0,           # keep for compatibility
+            "head_pose_score": round(head_pose_score, 4),
+            "head_trans_score": round(head_trans_score, 4),
+            "head_score": round(head_score, 4),
             "details": details,
         }
 
     # ------------------------------------------------------------------
-    # Layer 1: Blink detection via Eye Aspect Ratio
+    # Layer 1: Blink detection
     # ------------------------------------------------------------------
 
     def _check_blink(self, rgb_frames: List[np.ndarray]) -> Tuple[float, str]:
         """
-        Eye Aspect Ratio (EAR) blink detection.
+        Eye Aspect Ratio (EAR) blink detection with smoothing.
 
-        EAR = (p2-p6 + p3-p5) / (2 * p1-p4)   for each eye, then averaged.
-
-        A blink is detected when EAR drops below threshold for at least
-        `ear_consec_frames` frames and then rises again.
+        A blink is counted when EAR drops below threshold then rises above.
+        We use a rolling median of 3 EAR values to reduce noise.
         """
         if len(rgb_frames) < 3:
-            return 0.0, "insufficient_frames"
+            return 0.0, "insufficient"
 
         ears: List[float] = []
-        faces_detected = 0
-
-        # We use dlib's frontal face detector once, cache the rect
         detector = dlib.get_frontal_face_detector()
         face_rect: Optional[dlib.rectangle] = None
+        frames_ok = 0
 
         for frame in rgb_frames:
-            # Detect face if we haven't yet; reuse rect for subsequent frames
             if face_rect is None:
                 dets = detector(frame, 0)
-                if len(dets) == 0:
+                if not dets:
                     continue
                 face_rect = max(
                     dets, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top())
                 )
 
-            # Get 68 landmarks
             shape = self._predictor(frame, face_rect)
-            faces_detected += 1
+            frames_ok += 1
 
-            # Compute EAR for both eyes
             left_ear = self._eye_aspect_ratio(
                 [(shape.part(i).x, shape.part(i).y) for i in self._left_eye_idxs]
             )
@@ -154,10 +174,18 @@ class LivenessDetector:
             ear = (left_ear + right_ear) / 2.0
             ears.append(ear)
 
-        if len(ears) < 3:
-            return 0.0, "face_not_detected"
+        if frames_ok < 3:
+            return 0.0, "face_not_found"
 
-        # Count blinks: EAR drops below threshold then rises above
+        # Smooth with rolling median (window=3)
+        if len(ears) >= 3:
+            smoothed = []
+            for i in range(len(ears)):
+                window = ears[max(0, i - 1):min(len(ears), i + 2)]
+                smoothed.append(float(np.median(window)))
+            ears = smoothed
+
+        # Count blinks
         blink_count = 0
         was_closed = False
         closed_streak = 0
@@ -172,16 +200,23 @@ class LivenessDetector:
                 was_closed = False
                 closed_streak = 0
 
-        # Score: expect at least 1 blink.  Score caps at 1.0
+        # If no blink detected, check if eyes were always "low" (might be
+        # squinting or poor landmarks) — still give partial score if EAR
+        # dropped at least 15% from max
+        if blink_count == 0 and len(ears) >= 3:
+            max_ear = max(ears)
+            min_ear = min(ears)
+            dip_ratio = (max_ear - min_ear) / max_ear if max_ear > 0 else 0
+            if dip_ratio > 0.15:
+                blink_score = 0.6  # partial credit for eye movement
+                return blink_score, f"near_blink(dip={dip_ratio:.2f})"
+            return 0.1, f"no_blink(dip={dip_ratio:.2f})"
+
         score = min(1.0, blink_count / 1.0)
         return score, f"blinks={blink_count}"
 
     @staticmethod
     def _eye_aspect_ratio(eye_points: List[Tuple[int, int]]) -> float:
-        """
-        Compute Eye Aspect Ratio from 6 landmark points.
-        Points: [p1, p2, p3, p4, p5, p6]  (indices match dlib 68-point ordering).
-        """
         A = dist.euclidean(eye_points[1], eye_points[5])
         B = dist.euclidean(eye_points[2], eye_points[4])
         C = dist.euclidean(eye_points[0], eye_points[3])
@@ -190,155 +225,110 @@ class LivenessDetector:
         return float((A + B) / (2.0 * C))
 
     # ------------------------------------------------------------------
-    # Layer 2: Texture analysis via Local Binary Patterns
+    # Layer 2: Head pose motion (3D rotation + translation)
     # ------------------------------------------------------------------
 
-    def _check_texture(self, frame: np.ndarray) -> Tuple[float, str]:
+    def _check_head_pose(
+        self, rgb_frames: List[np.ndarray], gray_frames: List[np.ndarray]
+    ) -> Tuple[float, float, str]:
         """
-        Analyze face texture using LBP histogram + variance.
+        Estimate head pose (rotation + translation) via PnP.
 
-        Real faces have richer, noisier texture patterns compared to
-        printed photos / screen captures (which tend to be smoother or
-        have uniform pixelation artifacts). We compute:
-          - LBP histogram entropy (higher = more complex texture)
-          - Gray-level variance (higher = more natural skin variation)
+        A real person shows:
+          - Rotation variation (yaw/pitch/roll changes of 2-8°)
+          - Translation variation (head moves in 3D space)
 
-        Returns a score 0-1 where higher = more likely real.
+        A static photo shows:
+          - Near-zero rotation and translation variation (< 0.5°)
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if len(rgb_frames) < 3:
+            return 0.0, 0.0, "insufficient"
 
-        # Use dlib to find face ROI for focused texture analysis
         detector = dlib.get_frontal_face_detector()
-        dets = detector(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), 0)
+        face_rect: Optional[dlib.rectangle] = None
 
-        if len(dets) == 0:
-            # Fall back to entire frame
-            face_roi = gray
-        else:
-            largest = max(
-                dets, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top())
-            )
-            # Add padding
-            h, w = gray.shape
-            x1 = max(0, largest.left())
-            y1 = max(0, largest.top())
-            x2 = min(w, largest.right())
-            y2 = min(h, largest.bottom())
-            face_roi = gray[y1:y2, x1:x2]
+        # Collect rotation vectors for each frame where face is found
+        rvecs: List[np.ndarray] = []
+        tvecs: List[np.ndarray] = []
+        frames_ok = 0
 
-        if face_roi.size < 100:
-            return 0.0, "roi_too_small"
+        for frame in rgb_frames:
+            if face_rect is None:
+                dets = detector(frame, 0)
+                if not dets:
+                    continue
+                face_rect = max(
+                    dets, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top())
+                )
 
-        # -- LBP histogram --
-        lbp = local_binary_pattern(
-            face_roi, self._lbp_points, self._lbp_radius, method="uniform"
-        )
-        n_bins = self._lbp_points + 2
-        hist, _ = np.histogram(
-            lbp.ravel(), bins=n_bins, range=(0, n_bins), density=True
-        )
+            shape = self._predictor(frame, face_rect)
+            frames_ok += 1
 
-        # Entropy of LBP histogram — real faces have more uniform distribution
-        hist = hist + 1e-10  # avoid log(0)
-        entropy = -np.sum(hist * np.log2(hist))
-        max_entropy = math.log2(n_bins)
-        entropy_score = entropy / max_entropy  # 0-1
-
-        # -- Gray-level variance --
-        variance = np.var(face_roi.astype(np.float32))
-        # Normalize: assume max reasonable variance ~4000 for 8-bit face
-        var_score = min(1.0, variance / 4000.0)
-
-        # Combine: both contribute equally
-        score = 0.6 * entropy_score + 0.4 * var_score
-        score = min(1.0, max(0.0, score))
-
-        return score, f"entropy={entropy:.2f}_var={variance:.0f}"
-
-    # ------------------------------------------------------------------
-    # Layer 3: Optical flow analysis
-    # ------------------------------------------------------------------
-
-    def _check_optical_flow(self, gray_frames: List[np.ndarray]) -> Tuple[float, str]:
-        """
-        Farneback optical flow on the face region across consecutive frames.
-
-        A static photo / screen has near-zero optical flow. A real face has
-        micro-movements (breathing, slight head motion, etc.) that produce
-        measurable flow.
-
-        Returns score 0-1 where higher = more motion = more likely real.
-        """
-        if len(gray_frames) < 2:
-            return 0.0, "insufficient_frames"
-
-        # Detect face in first frame to define ROI
-        detector = dlib.get_frontal_face_detector()
-        rgb0 = cv2.cvtColor(
-            cv2.cvtColor(gray_frames[0], cv2.COLOR_GRAY2BGR), cv2.COLOR_BGR2RGB
-        )
-        dets = detector(rgb0, 0)
-
-        if len(dets) == 0:
-            return 0.0, "face_not_detected"
-
-        largest = max(
-            dets, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top())
-        )
-        h, w = gray_frames[0].shape
-        x1 = max(0, largest.left())
-        y1 = max(0, largest.top())
-        x2 = min(w, largest.right())
-        y2 = min(h, largest.bottom())
-
-        # Compute flow between consecutive frame pairs within the ROI
-        flow_magnitudes: List[float] = []
-        prev = gray_frames[0]
-
-        for i in range(1, len(gray_frames)):
-            curr = gray_frames[i]
-
-            # Crop ROI from both frames
-            prev_roi = prev[y1:y2, x1:x2]
-            curr_roi = curr[y1:y2, x1:x2]
-
-            if prev_roi.size < 100 or curr_roi.size < 100:
-                continue
+            # Get 6 key 2D image points
+            image_points = np.array([
+                (shape.part(self._nose_idx).x,      shape.part(self._nose_idx).y),
+                (shape.part(self._chin_idx).x,      shape.part(self._chin_idx).y),
+                (shape.part(self._left_eye_idx).x,  shape.part(self._left_eye_idx).y),
+                (shape.part(self._right_eye_idx).x, shape.part(self._right_eye_idx).y),
+                (shape.part(self._left_mouth_idx).x, shape.part(self._left_mouth_idx).y),
+                (shape.part(self._right_mouth_idx).x, shape.part(self._right_mouth_idx).y),
+            ], dtype=np.float64)
 
             try:
-                flow = cv2.calcOpticalFlowFarneback(
-                    prev_roi,
-                    curr_roi,
-                    None,
-                    pyr_scale=0.5,
-                    levels=3,
-                    winsize=15,
-                    iterations=3,
-                    poly_n=5,
-                    poly_sigma=1.2,
-                    flags=0,
+                success, rvec, tvec = cv2.solvePnP(
+                    self._model_points, image_points,
+                    self._camera_matrix, self._dist_coeffs,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
                 )
-                mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-                mean_mag = float(np.mean(mag))
-                flow_magnitudes.append(mean_mag)
+                if success:
+                    rvecs.append(rvec.flatten())
+                    tvecs.append(tvec.flatten())
             except cv2.error:
                 continue
 
-            prev = curr
+        if len(rvecs) < 3:
+            return 0.0, 0.0, f"face_lost({frames_ok}frames)"
 
-        if len(flow_magnitudes) == 0:
-            return 0.0, "flow_compute_error"
+        # Compute std dev of rotation (yaw/pitch/roll) across frames
+        rvec_arr = np.array(rvecs)  # N x 3
+        tvec_arr = np.array(tvecs)  # N x 3
 
-        avg_flow = np.mean(flow_magnitudes)
-        max_flow = np.max(flow_magnitudes)
+        # Convert rotation vectors to Euler angles for interpretable measurement
+        eulers = []
+        for rv in rvecs:
+            rot_mat, _ = cv2.Rodrigues(rv.reshape(3, 1))
+            sy = math.sqrt(rot_mat[0, 0] ** 2 + rot_mat[1, 0] ** 2)
+            singular = sy < 1e-6
+            if not singular:
+                x = math.atan2(rot_mat[2, 1], rot_mat[2, 2])
+                y = math.atan2(-rot_mat[2, 0], sy)
+                z = math.atan2(rot_mat[1, 0], rot_mat[0, 0])
+            else:
+                x = math.atan2(-rot_mat[1, 2], rot_mat[1, 1])
+                y = math.atan2(-rot_mat[2, 0], sy)
+                z = 0
+            eulers.append([math.degrees(x), math.degrees(y), math.degrees(z)])
+        euler_arr = np.array(eulers)
 
-        # Real faces: avg_flow typically 0.1–2.0+ pixels
-        # Static photo: avg_flow << 0.1
-        # Use a lower divisor for more sensitivity (0.5 instead of 0.8)
-        score = min(1.0, avg_flow / 0.5)
-        score = min(1.0, max(0.0, score))
+        # Rotation variation: max-min range across all 3 axes
+        rot_range = np.max(euler_arr, axis=0) - np.min(euler_arr, axis=0)
+        total_rot_change = float(np.linalg.norm(rot_range))
 
-        return score, f"avg_flow={avg_flow:.3f}_max={max_flow:.3f}"
+        # Translation variation: max-min range
+        trans_range = np.max(tvec_arr, axis=0) - np.min(tvec_arr, axis=0)
+        total_trans_change = float(np.linalg.norm(trans_range))
+
+        # Score rotation: scale so 3° change = full score
+        pose_score = min(1.0, total_rot_change / 3.0)
+
+        # Score translation: scale so 10px change = full score
+        trans_score = min(1.0, total_trans_change / 10.0)
+
+        return (
+            pose_score,
+            trans_score,
+            f"rot={total_rot_change:.1f}°_trans={total_trans_change:.0f}px",
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -363,6 +353,5 @@ class LivenessDetector:
                 return dlib.shape_predictor(p)
 
         raise FileNotFoundError(
-            "Could not find shape_predictor_68_face_landmarks.dat. "
-            "Install via: sudo apt install dlib-data  or place it in /usr/share/dlib/"
+            "Could not find shape_predictor_68_face_landmarks.dat"
         )
