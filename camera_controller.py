@@ -35,7 +35,7 @@ class CameraController:
         """Start the camera with configured resolution and framerate."""
         try:
             from picamera2 import Picamera2
-            from libcamera import transforms
+            from libcamera import Transform
 
             self._camera = Picamera2()
 
@@ -43,7 +43,7 @@ class CameraController:
             config = self._camera.create_video_configuration(
                 main={"size": self.resolution, "format": "RGB888"},
                 controls={"FrameRate": self.framerate},
-                transform=transforms.Transforms(),
+                transform=Transform(),
             )
             self._camera.configure(config)
             self._camera.start()
