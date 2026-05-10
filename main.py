@@ -71,6 +71,7 @@ class FaceDoorSystem:
         self._latest_frame = None
         self._matched_id = None
         self._last_distance = float('inf')
+        self._show_preview_enabled = False  # will be set after GUI check
 
         self.camera = None
         self.relay = None
@@ -93,6 +94,19 @@ class FaceDoorSystem:
     def _init_controllers(self):
         """Create and start all controllers. Called once in INIT state."""
         print("[Main] Initializing controllers...")
+
+        # Check if OpenCV has GUI support for the preview window
+        try:
+            test_img = np.zeros((10, 10, 3), dtype=np.uint8)
+            cv2.imshow(CV2_WINDOW + "_test", test_img)
+            cv2.waitKey(1)
+            cv2.destroyWindow(CV2_WINDOW + "_test")
+            self._show_preview_enabled = True
+            print("[Main] Preview window enabled (press 'q' to quit)")
+        except Exception:
+            self._show_preview_enabled = False
+            print("[Main] Preview window not available (opencv-python-headless)")
+            print("[Main] Install libgtk: sudo apt install python3-opencv or rebuild opencv with GUI")
 
         self.camera = CameraController()
         if not self.camera.start():
@@ -138,7 +152,7 @@ class FaceDoorSystem:
     # ── Preview Window ──────────────────────────────────────────────
     def _show_preview(self, frame, state_label="", info_lines=None):
         """Annotate frame with status info and show in cv2 window."""
-        if frame is None:
+        if frame is None or not self._show_preview_enabled:
             return
         display = frame.copy()
         h, w = display.shape[:2]
