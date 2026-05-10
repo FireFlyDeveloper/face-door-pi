@@ -70,8 +70,9 @@ class FaceRecognizer:
         """
         # dlib expects RGB; convert if needed
         rgb = self._to_rgb(image)
-        # Upsample 1x for slightly better small-face detection
-        return self._detector(rgb, 1)
+        # No upsampling — faster for close-range door use
+        # (person will be ~0.5-1m from camera)
+        return self._detector(rgb, 0)
 
     def get_face_encoding(
         self, image: np.ndarray

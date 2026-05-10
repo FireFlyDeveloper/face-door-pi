@@ -75,7 +75,10 @@ class FaceDoorSystem:
         self._latest_frame = None
         self._matched_id = None
         self._last_distance = float('inf')
-        self._show_preview_enabled = False  # will be set after GUI check
+        self._show_preview_enabled = False
+        self._frame_count = 0
+        self._fps_timer = time.time()
+        self._fps_counter = 0  # will be set after GUI check
 
         self.camera = None
         self.relay = None
@@ -306,17 +309,30 @@ class FaceDoorSystem:
 
     # ── State: SCANNING ──────────────────────────────────────────────
     def _state_scanning(self):
-        """Capture frames, detect faces, and listen for BT connections."""
+        """Capture frames, detect faces (every 3rd frame), listen for BT."""
         frame = self.camera.capture_frame()
         if frame is None:
             time.sleep(FRAME_INTERVAL)
             return
 
         self._latest_frame = frame
+        self._frame_count += 1
+        self._fps_counter += 1
 
-        # Detect faces using face recognizer
-        face_locations = self.face_recognizer.detect_faces(frame)
-        self._last_face_locations = face_locations
+        # Log FPS every 30 frames
+        if self._fps_counter >= 30:
+            elapsed = time.time() - self._fps_timer
+            fps = self._fps_counter / elapsed
+            print(f"[Main] ~{fps:.1f} fps ({self._frame_count} frames)")
+            self._fps_timer = time.time()
+            self._fps_counter = 0
+
+        # Face detection every 3rd frame only (saves ~2x speed)
+        if self._frame_count % 3 == 1:
+            face_locations = self.face_recognizer.detect_faces(frame)
+            self._last_face_locations = face_locations
+        else:
+            face_locations = self._last_face_locations or []
 
         # Show preview
         if face_locations:
