@@ -110,27 +110,42 @@ class LivenessDetector:
             rgb_frames, gray_frames
         )
 
-        # Combined head score = max(rotation, translation)
-        head_score = max(head_pose_score, head_trans_score)
+        # Layer 3: Screen detection (phone vs real face texture)
+        screen_score, screen_detail = self._check_screen(rgb_frames)
+
+        # Combined head score: rotation ONLY — translation is easy to fake (phone movement)
+        head_score = head_pose_score
 
         # Total = weighted sum
         score = blink_score * self._blink_weight + head_score * self._head_weight
+
+        # HARD RULE: A static picture CANNOT blink. If no blink and no near-blink,
+        # hard-cap the score below threshold regardless of other layers.
+        if blink_score < 0.3:
+            score = min(score, self._pass_threshold - 0.05)
+
+        # HARD RULE: If screen is detected (phone/tablet), reduce score heavily
+        if screen_score < 0.3:
+            score *= 0.3
+
         passed = score >= self._pass_threshold
 
         details = (
             f"Blink({blink_detail}) "
-            f"Head({head_detail})"
+            f"Head({head_detail}) "
+            f"Screen({screen_detail})"
         )
 
         return {
             "passed": passed,
             "score": round(score, 4),
             "blink_score": round(blink_score, 4),
-            "texture_score": 0.0,        # keep for compatibility
-            "flow_score": 0.0,           # keep for compatibility
+            "texture_score": 0.0,
+            "flow_score": 0.0,
             "head_pose_score": round(head_pose_score, 4),
             "head_trans_score": round(head_trans_score, 4),
             "head_score": round(head_score, 4),
+            "screen_score": round(screen_score, 4),
             "details": details,
         }
 
@@ -329,6 +344,83 @@ class LivenessDetector:
             trans_score,
             f"rot={total_rot_change:.1f}°_trans={total_trans_change:.0f}px",
         )
+
+    # ------------------------------------------------------------------
+    # Layer 3: Screen detection (phone/tablet anti-spoofing)
+    # ------------------------------------------------------------------
+
+    def _check_screen(self, rgb_frames: List[np.ndarray]) -> Tuple[float, str]:
+        """
+        Detect if the face is displayed on a screen (phone/tablet) vs real.
+
+        Uses two signals:
+          1. Laplacian variance: phone screens have unnaturally uniform
+             texture compared to real skin (lower variance).
+          2. Edge density: phone screens have sharp rectangular borders
+             (the device bezel) visible in the frame.
+
+        Returns score 0-1 where higher = more likely a real face.
+        """
+        if not rgb_frames:
+            return 0.5, "no_frames"
+
+        # Use the middle frame
+        frame = rgb_frames[len(rgb_frames) // 2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        h, w = gray.shape
+
+        # ── Signal 1: Laplacian variance (texture uniformity) ──
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        lap_var = float(np.var(lap))
+
+        # Real faces at 640x480 typically have lap_var 20-200+
+        # Phone screens showing a face typically have lap_var 5-40
+        # (smoother due to pixel grid + display backlight)
+        # Score: higher variance = more likely real
+        if lap_var < 10:
+            lap_score = 0.0  # very uniform → screen
+        elif lap_var > 60:
+            lap_score = 1.0  # rich texture → real face
+        else:
+            lap_score = (lap_var - 10) / 50.0  # linear ramp
+
+        lap_score = max(0.0, min(1.0, lap_score))
+
+        # ── Signal 2: Edge density in peripheral regions ──
+        # Phone screens have sharp bezel edges. We look for straight
+        # edges near the frame borders using Hough lines.
+        edges = cv2.Canny(gray, 50, 150)
+        # Only check the outer 20% of the frame (screen bezel area)
+        border_w = int(w * 0.2)
+        border_h = int(h * 0.2)
+        # Create a mask for the border region (ring around center)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        # Fill the outer ring
+        mask[border_h:-border_h, border_w:-border_w] = 255
+        mask = cv2.bitwise_not(mask)
+        border_edges = cv2.bitwise_and(edges, edges, mask=mask)
+
+        # Count strong edge pixels in the border region
+        border_edge_count = np.count_nonzero(border_edges)
+        total_border_pixels = np.count_nonzero(mask)
+        border_edge_density = border_edge_count / total_border_pixels if total_border_pixels > 0 else 0
+
+        # Real faces: low edge density in peripheral area
+        # Phone screen: higher edge density (bezel edges)
+        if border_edge_density < 0.005:
+            border_score = 1.0  # natural background
+        elif border_edge_density > 0.03:
+            border_score = 0.0  # lots of edges → possible screen border
+        else:
+            border_score = 1.0 - (border_edge_density - 0.005) / 0.025
+
+        border_score = max(0.0, min(1.0, border_score))
+
+        # ── Combined score ──
+        score = 0.6 * lap_score + 0.4 * border_score
+        score = max(0.0, min(1.0, score))
+
+        return score, f"lapvar={lap_var:.0f}_edge={border_edge_density:.4f}"
 
     # ------------------------------------------------------------------
     # Internal helpers
