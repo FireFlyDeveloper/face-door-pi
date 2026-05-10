@@ -60,6 +60,10 @@ class State:
 # CV2 display window name
 CV2_WINDOW = "Face Door System"
 
+# ── CLI args ─────────────────────────────────────────────────────────
+HEADLESS = "--headless" in sys.argv or "-H" in sys.argv
+PREVIEW = "--preview" in sys.argv or "-p" in sys.argv
+
 
 class FaceDoorSystem:
     """Main door system orchestrator with state machine loop."""
@@ -95,20 +99,24 @@ class FaceDoorSystem:
         """Create and start all controllers. Called once in INIT state."""
         print("[Main] Initializing controllers...")
 
-        # Check if OpenCV has GUI support for the preview window
-        # Set offscreen to avoid Qt crash when no display is available
-        os.environ["QT_QPA_PLATFORM"] = "offscreen"
-        try:
-            test_img = np.zeros((10, 10, 3), dtype=np.uint8)
-            cv2.imshow(CV2_WINDOW + "_test", test_img)
-            cv2.waitKey(1)
-            cv2.destroyWindow(CV2_WINDOW + "_test")
-            self._show_preview_enabled = True
-            print("[Main] Preview window enabled (press 'q' to quit)")
-        except Exception:
+        # Preview window — only try if explicitly requested with --preview
+        if PREVIEW:
+            try:
+                test_img = np.zeros((10, 10, 3), dtype=np.uint8)
+                cv2.imshow(CV2_WINDOW + "_test", test_img)
+                cv2.waitKey(1)
+                cv2.destroyWindow(CV2_WINDOW + "_test")
+                self._show_preview_enabled = True
+                print("[Main] Preview window enabled (press 'q' to quit)")
+            except Exception:
+                self._show_preview_enabled = False
+                print("[Main] --preview requested but no display available")
+        elif HEADLESS:
             self._show_preview_enabled = False
-            print("[Main] Preview window not available (opencv-python-headless)")
-            print("[Main] Install libgtk: sudo apt install python3-opencv or rebuild opencv with GUI")
+            print("[Main] Headless mode — no preview window")
+        else:
+            self._show_preview_enabled = False
+            print("[Main] No preview window (use --preview to enable, --headless to suppress)")
 
         self.camera = CameraController()
         if not self.camera.start():
