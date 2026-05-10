@@ -1,0 +1,9 @@
+# Face Door System — pip dependencies
+# System packages (install via apt):
+#   sudo apt install python3-picamera2 python3-rpi.gpio python3-bluez
+#
+# These are installed via pip:
+opencv-python-headless
+face_recognition
+numpy
+scipy
