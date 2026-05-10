@@ -99,8 +99,8 @@ class FaceDoorSystem:
         """Create and start all controllers. Called once in INIT state."""
         print("[Main] Initializing controllers...")
 
-        # Preview window — only try if explicitly requested with --preview
-        if PREVIEW:
+        # Preview window — only if a display is available (HDMI monitor or ssh -X)
+        if PREVIEW or (not HEADLESS and os.environ.get("DISPLAY", "")):
             try:
                 test_img = np.zeros((10, 10, 3), dtype=np.uint8)
                 cv2.imshow(CV2_WINDOW + "_test", test_img)
@@ -110,13 +110,9 @@ class FaceDoorSystem:
                 print("[Main] Preview window enabled (press 'q' to quit)")
             except Exception:
                 self._show_preview_enabled = False
-                print("[Main] --preview requested but no display available")
-        elif HEADLESS:
-            self._show_preview_enabled = False
-            print("[Main] Headless mode — no preview window")
+                print("[Main] Preview not available — install python3-opencv (system pkg)")
         else:
             self._show_preview_enabled = False
-            print("[Main] No preview window (use --preview to enable, --headless to suppress)")
 
         self.camera = CameraController()
         if not self.camera.start():
