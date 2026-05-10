@@ -357,15 +357,26 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    # ── State: COLLECTING ────────────────────────────────────────────
+    #    ── State: COLLECTING ────────────────────────────────────────────
     def _state_collecting(self):
-        """Collect LIVENESS_FRAMES consecutive frames for liveness analysis."""
+        """Collect LIVENESS_FRAMES frames for liveness, abort if face lost."""
         frame = self.camera.capture_frame()
         if frame is None:
             return
 
         self._latest_frame = frame
         self._liveness_frames.append(frame)
+        self._frame_count += 1
+
+        # Every 5 frames, verify face is still visible
+        if len(self._liveness_frames) % 5 == 0:
+            faces = self.face_recognizer.detect_faces(frame)
+            self._last_face_locations = faces
+            if not faces:
+                print("[Main] Face lost during collection — resetting to SCANNING")
+                self._liveness_frames = []
+                self.state = State.SCANNING
+                return
 
         # Show preview with progress
         progress = len(self._liveness_frames)
