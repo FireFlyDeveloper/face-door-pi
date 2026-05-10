@@ -24,12 +24,12 @@ class LivenessDetector:
 
     def __init__(self):
         # Thresholds
-        self._ear_threshold: float = 0.2       # below this = eye closed
+        self._ear_threshold: float = 0.25      # below this = eye closed (relaxed from 0.2)
         self._ear_consec_frames: int = 1        # frames closed to count as blink
         self._blink_weight: float = 0.4
         self._texture_weight: float = 0.3
         self._flow_weight: float = 0.3
-        self._pass_threshold: float = 0.5
+        self._pass_threshold: float = 0.4      # lowered from 0.5 for real-world use
 
         # LBP params
         self._lbp_radius: int = 1
@@ -334,8 +334,8 @@ class LivenessDetector:
 
         # Real faces: avg_flow typically 0.1–2.0+ pixels
         # Static photo: avg_flow << 0.1
-        # Score uses a sigmoid-like mapping
-        score = min(1.0, avg_flow / 0.8)
+        # Use a lower divisor for more sensitivity (0.5 instead of 0.8)
+        score = min(1.0, avg_flow / 0.5)
         score = min(1.0, max(0.0, score))
 
         return score, f"avg_flow={avg_flow:.3f}_max={max_flow:.3f}"
