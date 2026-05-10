@@ -57,6 +57,10 @@ class State:
     REJECTED = "REJECTED"
 
 
+# CV2 display window name
+CV2_WINDOW = "Face Door System"
+
+
 class FaceDoorSystem:
     """Main door system orchestrator with state machine loop."""
 
@@ -126,6 +130,46 @@ class FaceDoorSystem:
             try: self.buzzer.cleanup()
             except Exception: pass
         print("[Main] Cleanup complete")
+        try:
+            cv2.destroyWindow(CV2_WINDOW)
+        except Exception:
+            pass
+
+    # ── Preview Window ──────────────────────────────────────────────
+    def _show_preview(self, frame, state_label="", info_lines=None):
+        """Annotate frame with status info and show in cv2 window."""
+        if frame is None:
+            return
+        display = frame.copy()
+        h, w = display.shape[:2]
+
+        # Draw state label at top
+        cv2.rectangle(display, (0, 0), (w, 40), (0, 0, 0), -1)
+        cv2.putText(display, state_label, (10, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        # Draw info lines at bottom
+        if info_lines:
+            y_start = h - 10 - (len(info_lines) * 22)
+            for i, line in enumerate(info_lines):
+                y = y_start + i * 22
+                cv2.putText(display, line, (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        # Draw face detections
+        if hasattr(self, '_last_face_locations') and self._last_face_locations:
+            for rect in self._last_face_locations:
+                x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
+                cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        cv2.imshow(CV2_WINDOW, display)
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            print("[Main] 'q' pressed — shutting down")
+            self._running = False
+        elif key == ord('d'):
+            # Toggle debug overlay with distance/match info
+            self._show_debug = not getattr(self, '_show_debug', False)
 
     # ── Helper: decode base64 image to np.ndarray (BGR) ────────────
     @staticmethod
@@ -252,6 +296,14 @@ class FaceDoorSystem:
 
         # Detect faces using face recognizer
         face_locations = self.face_recognizer.detect_faces(frame)
+        self._last_face_locations = face_locations
+
+        # Show preview
+        if face_locations:
+            self._show_preview(frame, "SCANNING — FACE DETECTED",
+                               [f"Faces: {len(face_locations)}"])
+        else:
+            self._show_preview(frame, "SCANNING")
 
         if face_locations:
             print("[Main] Face detected — transitioning to COLLECTING")
@@ -279,6 +331,11 @@ class FaceDoorSystem:
         self._latest_frame = frame
         self._liveness_frames.append(frame)
 
+        # Show preview with progress
+        progress = len(self._liveness_frames)
+        self._show_preview(frame, "COLLECTING",
+                           [f"Frame {progress}/{LIVENESS_FRAMES}"])
+
         if len(self._liveness_frames) >= LIVENESS_FRAMES:
             print(f"[Main] Collected {LIVENESS_FRAMES} frames for liveness")
             self.state = State.LIVENESS_CHECK
@@ -289,12 +346,18 @@ class FaceDoorSystem:
         print("[Main] Running liveness check...")
         try:
             result = self.liveness.check_liveness(self._liveness_frames)
+            score = result['score']
+            details = result.get('details', '')
             if result['passed']:
-                print(f"[Main] Liveness PASSED (score={result['score']:.3f})")
+                print(f"[Main] Liveness PASSED (score={score:.3f})")
+                self._show_preview(self._latest_frame, "LIVENESS PASSED ✅",
+                                   [f"Score: {score:.2f}", details])
                 self.state = State.COMPARE
             else:
-                print(f"[Main] Liveness FAILED (score={result['score']:.3f})")
-                print(f"[Main]   Details: {result['details']}")
+                print(f"[Main] Liveness FAILED (score={score:.3f})")
+                self._show_preview(self._latest_frame, "LIVENESS FAILED ❌",
+                                   [f"Score: {score:.2f}", details])
+                time.sleep(1)
                 self.state = State.REJECTED
         except Exception as e:
             print(f"[Main] Liveness check error: {e}")
@@ -338,11 +401,17 @@ class FaceDoorSystem:
             if best_match is not None and self._last_distance < MATCH_THRESHOLD:
                 print(f"[Main] Match: {best_match} (dist={self._last_distance:.4f}) — GRANTED")
                 self._matched_id = best_match
+                self._show_preview(self._latest_frame, f"MATCH: {best_match} ✅",
+                                   [f"Distance: {self._last_distance:.3f}",
+                                    f"Threshold: {MATCH_THRESHOLD}"])
                 self.state = State.GRANTED
             else:
                 reason = "no_match" if best_match is None else f"dist={self._last_distance:.4f}"
                 print(f"[Main] No match ({reason}) — REJECTED")
-                self.state = State.REJECTED
+                self._show_preview(self._latest_frame, "NO MATCH ❌",
+                                   [f"Best dist: {self._last_distance:.3f}",
+                                    f"Threshold: {MATCH_THRESHOLD}"])
+                time.sleep(1.5)
 
         except Exception as e:
             print(f"[Main] Compare error: {e}")
@@ -366,6 +435,14 @@ class FaceDoorSystem:
             details=f'distance={self._last_distance:.4f}'
         )
 
+        # Keep showing the match on screen during unlock
+        if self._latest_frame is not None:
+            for _ in range(int(UNLOCK_DURATION * 5)):
+                if not self._running:
+                    break
+                self._show_preview(self._latest_frame, f"DOOR UNLOCKED — {face_id} ✅")
+                time.sleep(0.2)
+
         self._liveness_frames = []
         self.state = State.SCANNING
 
@@ -383,6 +460,11 @@ class FaceDoorSystem:
             result='REJECTED',
             details='liveness_failed_or_no_match'
         )
+
+        # Show rejection on screen briefly
+        if self._latest_frame is not None:
+            self._show_preview(self._latest_frame, "ACCESS DENIED ❌")
+            time.sleep(1)
 
         self._liveness_frames = []
         self.state = State.SCANNING
