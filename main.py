@@ -96,6 +96,8 @@ class FaceDoorSystem:
         print("[Main] Initializing controllers...")
 
         # Check if OpenCV has GUI support for the preview window
+        # Set offscreen to avoid Qt crash when no display is available
+        os.environ["QT_QPA_PLATFORM"] = "offscreen"
         try:
             test_img = np.zeros((10, 10, 3), dtype=np.uint8)
             cv2.imshow(CV2_WINDOW + "_test", test_img)
