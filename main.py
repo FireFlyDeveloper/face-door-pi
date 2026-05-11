@@ -628,6 +628,19 @@ class FaceDoorSystem:
         self._rf_unlock_state = False
         self._rf_last_lock_ts = 0.0
         self._rf_last_unlock_ts = 0.0
+        # Read initial GPIO states to prevent false trigger on first poll
+        try:
+            import RPi.GPIO as GPIO
+            if not GPIO.getmode():
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setwarnings(False)
+                GPIO.setup(22, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+                GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
+            self._rf_lock_state = bool(GPIO.input(22))
+            self._rf_unlock_state = bool(GPIO.input(23))
+            print(f"[Main] Initial GPIO: GPIO22={int(self._rf_lock_state)} GPIO23={int(self._rf_unlock_state)}")
+        except Exception as e:
+            print(f"[Main] GPIO init error: {e}")
 
         self.state = State.SCANNING
         print(f"[Main] Entering auto-scan loop at ~{FRAME_RATE}fps")
