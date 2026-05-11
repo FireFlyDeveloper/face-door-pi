@@ -27,6 +27,7 @@ class BluetoothServer:
         self.client_sock = None
         self.client_address = None
         self._running = False
+        self._recv_buffer = ""  # buffer for fragmented SPP messages
 
     def start(self):
         """Bind and listen on the RFCOMM socket. Set discoverable. Print MAC + port."""
@@ -93,9 +94,26 @@ class BluetoothServer:
             print(f"[BluetoothServer] Send failed: {e}")
 
     def receive(self, timeout=30.0):
-        """Read one JSON line from the client socket. Returns dict or None on timeout/disconnect."""
+        """Read one complete JSON line from the client socket.
+
+        Uses an internal buffer to handle fragmented SPP messages
+        (common for large payloads like base64 images).
+
+        Returns dict or None on timeout/disconnect/parse error.
+        """
         if self.client_sock is None:
             return None
+
+        # Check if we already have a complete line in the buffer
+        if '\n' in self._recv_buffer:
+            line, self._recv_buffer = self._recv_buffer.split('\n', 1)
+            if line.strip():
+                try:
+                    return json.loads(line.strip())
+                except json.JSONDecodeError:
+                    print(f"[BluetoothServer] Invalid JSON in buffer: {line[:80]}...")
+                    return None
+
         try:
             ready = select.select([self.client_sock], [], [], timeout)
             if not ready[0]:
@@ -105,25 +123,47 @@ class BluetoothServer:
             data = self.client_sock.recv(4096)
             if not data:
                 print("[BluetoothServer] Client disconnected")
+                self._recv_buffer = ""
                 self.disconnect_client()
                 return None
 
-            # Decode and parse the first line of JSON
-            text = data.decode('utf-8').strip()
-            return json.loads(text)
+            # Append new data to buffer
+            chunk = data.decode('utf-8')
+            self._recv_buffer += chunk
+
+            # Try to extract a complete JSON line
+            if '\n' in self._recv_buffer:
+                line, self._recv_buffer = self._recv_buffer.split('\n', 1)
+                if line.strip():
+                    try:
+                        return json.loads(line.strip())
+                    except json.JSONDecodeError:
+                        print(f"[BluetoothServer] Invalid JSON received: {line[:80]}...")
+                        return None
+                # Empty line — keep waiting
+                return None
+            else:
+                # Still waiting for the rest of the message
+                print(f"[BluetoothServer] Partial message ({(len(chunk))}B), waiting for more...")
+                return None
+
         except json.JSONDecodeError:
             print(f"[BluetoothServer] Invalid JSON received")
+            self._recv_buffer = ""
             return None
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             print(f"[BluetoothServer] Connection error during receive: {e}")
+            self._recv_buffer = ""
             self.disconnect_client()
             return None
         except Exception as e:
             print(f"[BluetoothServer] Receive error: {e}")
+            self._recv_buffer = ""
             return None
 
     def close_connection(self):
         """Close the client socket."""
+        self._recv_buffer = ""
         self._cleanup_socket(self.client_sock)
         self.client_sock = None
         self.client_address = None
@@ -137,6 +177,7 @@ class BluetoothServer:
                 pass
             self.client_sock = None
             self.client_address = None
+            self._recv_buffer = ""
             print("[BluetoothServer] Client disconnected")
 
     def is_client_connected(self):
