@@ -1,6 +1,8 @@
 """
 relay_controller.py — 5V relay module for solenoid lock via GPIO.
 
+Active-low relay: LOW = ON (energized/unlocked), HIGH = OFF (de-energized/locked).
+
 Provides:
   - unlock(duration)  — pulse unlock for N seconds (face-recognition auto-unlock)
   - lock() / unlock_persistent()  — set persistent relay state (RF remote / manual)
@@ -36,12 +38,13 @@ def _get_gpio():
 class RelayController:
     """Controls a 5V relay module for door lock actuation.
 
+    Active-low module: GPIO LOW = relay ON (unlocked), HIGH = relay OFF (locked).
+
     Supports two modes:
       - **Pulse mode** (face auto-unlock): ``unlock(duration)`` energizes
         for N seconds then de-energizes.
       - **Persistent mode** (RF remote / manual): ``set_state(locked)``
-        sets relay to HIGH (unlocked) or LOW (locked) permanently until
-        changed again.
+        sets relay permanently until changed again.
     """
 
     def __init__(self, pin: int = 17):
@@ -53,8 +56,9 @@ class RelayController:
             try:
                 self._gpio.setmode(self._gpio.BCM)
                 self._gpio.setwarnings(False)
-                self._gpio.setup(self.pin, self._gpio.OUT, initial=self._gpio.LOW)
-                logger.info("Relay pin %d initialized LOW (locked)", self.pin)
+                # Active-low: HIGH = OFF = locked
+                self._gpio.setup(self.pin, self._gpio.OUT, initial=self._gpio.HIGH)
+                logger.info("Relay pin %d initialized HIGH (locked, active-low)", self.pin)
             except Exception as exc:
                 logger.error("Failed to initialize relay on pin %d: %s", pin, exc)
                 self._gpio = None
@@ -64,26 +68,29 @@ class RelayController:
     # ── Pulse mode (face auto-unlock) ──────────────────────────────
 
     def unlock(self, duration: float = 3.0) -> bool:
-        """Energize relay for *duration* seconds, then restore persistent state."""
+        """Energize relay for *duration* seconds, then restore persistent state.
+
+        Active-low: LOW = ON (unlocked).
+        """
         if self._gpio is None:
             return False
 
         try:
-            logger.info("Pulse unlock for %.1f s (pin %d HIGH)", duration, self.pin)
-            self._gpio.output(self.pin, self._gpio.HIGH)
+            logger.info("Pulse unlock for %.1f s (pin %d LOW)", duration, self.pin)
+            self._gpio.output(self.pin, self._gpio.LOW)
             time.sleep(duration)
             # Restore persistent state
             if self._locked:
-                self._gpio.output(self.pin, self._gpio.LOW)
-                logger.info("Restored LOCKED state")
-            else:
                 self._gpio.output(self.pin, self._gpio.HIGH)
-                logger.info("Restored UNLOCKED state")
+                logger.info("Restored LOCKED state (HIGH)")
+            else:
+                self._gpio.output(self.pin, self._gpio.LOW)
+                logger.info("Restored UNLOCKED state (LOW)")
             return True
         except Exception as exc:
             logger.error("Relay unlock failed on pin %d: %s", self.pin, exc)
             try:
-                self._gpio.output(self.pin, self._gpio.LOW)
+                self._gpio.output(self.pin, self._gpio.HIGH)
             except Exception:
                 pass
             return False
@@ -93,6 +100,8 @@ class RelayController:
     def set_state(self, locked: bool) -> None:
         """Set persistent relay state.
 
+        Active-low: locked = HIGH (OFF), unlocked = LOW (ON).
+
         Args:
             locked: True = de-energize (locked), False = energize (unlocked).
         """
@@ -101,11 +110,11 @@ class RelayController:
             return
         try:
             if locked:
-                self._gpio.output(self.pin, self._gpio.LOW)
-                logger.info("Persistent state → LOCKED (pin %d LOW)", self.pin)
-            else:
                 self._gpio.output(self.pin, self._gpio.HIGH)
-                logger.info("Persistent state → UNLOCKED (pin %d HIGH)", self.pin)
+                logger.info("Persistent state → LOCKED (pin %d HIGH)", self.pin)
+            else:
+                self._gpio.output(self.pin, self._gpio.LOW)
+                logger.info("Persistent state → UNLOCKED (pin %d LOW)", self.pin)
         except Exception as exc:
             logger.error("Failed to set relay state: %s", exc)
 
@@ -136,8 +145,8 @@ class RelayController:
         if self._gpio is None:
             return
         try:
-            # Always revert to locked on shutdown
-            self._gpio.output(self.pin, self._gpio.LOW)
+            # Always revert to locked (HIGH = OFF) on shutdown
+            self._gpio.output(self.pin, self._gpio.HIGH)
             self._gpio.cleanup(self.pin)
             logger.info("GPIO cleanup for relay pin %d", self.pin)
         except Exception as exc:
