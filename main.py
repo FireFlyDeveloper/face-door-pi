@@ -41,7 +41,7 @@ from logger import ActivityLogger
 # ── Constants ───────────────────────────────────────────────────────────
 FRAME_RATE = 15.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
-LIVENESS_FRAMES = 30
+MAX_COLLECT_FRAMES = 90        # 6s window for 2 blinks at 15fps
 UNLOCK_DURATION = 3.0
 MATCH_THRESHOLD = 0.6
 
@@ -344,6 +344,7 @@ class FaceDoorSystem:
         if face_locations:
             print("[Main] Face detected — transitioning to COLLECTING")
             self._liveness_frames = []
+            # Don't reset liveness — blinks detected during scanning already count
             self.state = State.COLLECTING
             return
 
@@ -359,7 +360,7 @@ class FaceDoorSystem:
 
     #    ── State: COLLECTING ────────────────────────────────────────────
     def _state_collecting(self):
-        """Collect LIVENESS_FRAMES frames for liveness, abort if face lost."""
+        """Collect frames and detect blinks in real-time. Exits early on 2 blinks."""
         frame = self.camera.capture_frame()
         if frame is None:
             return
@@ -368,6 +369,11 @@ class FaceDoorSystem:
         self._liveness_frames.append(frame)
         self._frame_count += 1
 
+        # Process frame for blink detection (real-time)
+        lr = self.liveness.process_frame(frame)
+        blinks = lr['blinks_detected']
+        ear = lr['ear']
+
         # Every 5 frames, verify face is still visible
         if len(self._liveness_frames) % 5 == 0:
             faces = self.face_recognizer.detect_faces(frame)
@@ -375,17 +381,25 @@ class FaceDoorSystem:
             if not faces:
                 print("[Main] Face lost during collection — resetting to SCANNING")
                 self._liveness_frames = []
+                self.liveness.reset()
                 self.state = State.SCANNING
                 return
 
         # Show preview with progress
         progress = len(self._liveness_frames)
         self._show_preview(frame, "COLLECTING",
-                           [f"Frame {progress}/{LIVENESS_FRAMES}"])
+                           [f"Frame {progress}/{MAX_COLLECT_FRAMES}  Blinks: {blinks}  EAR: {ear:.2f}"])
 
-        if len(self._liveness_frames) >= LIVENESS_FRAMES:
-            print(f"[Main] Collected {LIVENESS_FRAMES} frames for liveness")
-            self.state = State.LIVENESS_CHECK
+        # Early exit: enough blinks detected
+        if lr['passed']:
+            print(f"[Main] Liveness PASSED — {blinks} blinks detected at frame {progress}")
+            self.state = State.COMPARE
+            return
+
+        # Timeout: too long without enough blinks
+        if len(self._liveness_frames) >= MAX_COLLECT_FRAMES:
+            print(f"[Main] Liveness FAILED — only {blinks}/2 blinks in {MAX_COLLECT_FRAMES} frames")
+            self.state = State.REJECTED
 
     # ── State: LIVENESS_CHECK ────────────────────────────────────────
     def _state_liveness_check(self):
