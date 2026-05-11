@@ -1,14 +1,12 @@
 """
-rf_receiver.py — 433MHz OOK remote receiver using GPIO edge-detection timing.
+rf_receiver.py — 433MHz remote receiver using wait_for_edge with pulse-width timing.
 
-Uses RPi.GPIO edge detection (BOTH edges) to capture pulse-width timings
-from a generic 433MHz OOK receiver module (FS1000A / MX-05V / XY-MK-5V).
+Uses RPi.GPIO.wait_for_edge() in a background thread to detect any signal
+change (BOTH edges), then records timestamps to identify valid RF bursts.
 
-When a valid burst of edges is detected (more than MIN_EDGES within
-BURST_WINDOW_MS), fires the callback with 'LOCK' or 'UNLOCK'.
-
-This approach works because 433MHz OOK receivers output a rapid series of
-HIGH/LOW transitions when a button is pressed (Manchester/OOK data stream).
+Handles two detection modes:
+1. Edge burst (OOK data stream): ≥2 edges within 150ms
+2. Falling hold (VT-type): pin stays LOW for >50ms after first falling edge
 """
 
 from __future__ import annotations
@@ -37,11 +35,7 @@ def _get_gpio():
 
 class RFReceiver:
     """
-    433MHz OOK remote receiver via GPIO edge-detection with pulse-width timing.
-
-    Records timestamps of every edge (BOTH rising and falling) and detects
-    bursts characteristic of 433MHz OOK data transmissions, OR a simple
-    voltage drop (single pulse) from VT-type receiver modules.
+    433MHz remote receiver using wait_for_edge with pulse-width timing.
 
     Attributes:
         lock_pin:   GPIO reading LOCK button receiver output.
@@ -49,76 +43,48 @@ class RFReceiver:
         is_configured: Always True (no code learning needed).
     """
 
-    # Minimum edges in a burst to qualify as a valid RF transmission
-    # Set low (2) to catch a single voltage-drop pulse (2 edges = HIGH→LOW→HIGH)
     MIN_EDGES = 2
-    # Time window (seconds) for a valid burst
     BURST_WINDOW_S = 0.15
-    # Debounce interval (seconds) between successive triggers
     DEBOUNCE_S = 0.30
+    EDGE_TIMEOUT_MS = 500  # wait_for_edge timeout in ms
 
     def __init__(self, lock_pin: int = 22, unlock_pin: int = 23):
-        """
-        Args:
-            lock_pin:   GPIO for LOCK receiver data pin.
-            unlock_pin: GPIO for UNLOCK receiver data pin.
-        """
         self.lock_pin = lock_pin
         self.unlock_pin = unlock_pin
         self._gpio = _get_gpio()
         self._callback: Optional[Callable[[str], None]] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._is_configured = True  # always ready
+        self._is_configured = True
 
-        # Burst detection state per pin
-        self._lock_edges: list[float] = []      # timestamps of last N edges
+        # Edge timestamp tracking per pin
+        self._lock_edges: list[float] = []
         self._unlock_edges: list[float] = []
-        self._last_lock_ts = 0.0                 # last debounced trigger
+        self._last_lock_ts = 0.0
         self._last_unlock_ts = 0.0
         self._lock_mutex = threading.Lock()
         self._unlock_mutex = threading.Lock()
-
-        if self._gpio is not None:
-            try:
-                self._gpio.setmode(self._gpio.BCM)
-                self._gpio.setwarnings(False)
-                self._gpio.setup(self.lock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
-                self._gpio.setup(self.unlock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
-                logger.info(
-                    "RF receiver: LOCK=GPIO%d, UNLOCK=GPIO%d (edge-detect)",
-                    self.lock_pin, self.unlock_pin,
-                )
-            except Exception as exc:
-                logger.error("Failed to init RF GPIOs: %s", exc)
-                self._gpio = None
-        else:
-            logger.warning("RPi.GPIO unavailable — RF receiver disabled")
 
     @property
     def is_configured(self) -> bool:
         return self._is_configured
 
     def set_callback(self, cb: Callable[[str], None]):
-        """Set callback receiving 'LOCK' or 'UNLOCK' on button press."""
         self._callback = cb
 
     def start(self) -> bool:
-        """Register GPIO edge detection and start keepalive thread. Returns True on success."""
         if self._gpio is None:
             return False
         try:
-            # Register edge detection on the MAIN thread (RPi.GPIO requirement)
-            self._gpio.add_event_detect(self.lock_pin, self._gpio.BOTH,
-                                        callback=self._on_lock_edge)
-            self._gpio.add_event_detect(self.unlock_pin, self._gpio.BOTH,
-                                        callback=self._on_unlock_edge)
+            self._gpio.setmode(self._gpio.BCM)
+            self._gpio.setwarnings(False)
+            self._gpio.setup(self.lock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
+            self._gpio.setup(self.unlock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
 
-            # Keepalive thread (only keeps the Python process from exiting)
             self._running = True
-            self._thread = threading.Thread(target=self._keep_alive, daemon=True)
+            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
             self._thread.start()
-            logger.info("RF edge detection active on GPIO%d, GPIO%d",
+            logger.info("RF receiver started (LOCK=GPIO%d, UNLOCK=GPIO%d)",
                         self.lock_pin, self.unlock_pin)
             return True
         except Exception as exc:
@@ -127,42 +93,86 @@ class RFReceiver:
             return False
 
     def stop(self):
-        """Stop the edge-detection thread and clean up."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
         if self._gpio is not None:
-            try:
-                self._gpio.remove_event_detect(self.lock_pin)
-            except Exception:
-                pass
-            try:
-                self._gpio.remove_event_detect(self.unlock_pin)
-            except Exception:
-                pass
+            self._gpio.cleanup(self.lock_pin)
+            self._gpio.cleanup(self.unlock_pin)
         logger.info("RF receiver stopped")
 
-    # ── Internal: edge detection ──────────────────────────────────────
+    # ── Internal: polling loop ───────────────────────────────────────
 
-    def _check_and_trigger(self, pin_name: str, edges: list, mutex: threading.Lock,
-                           last_ts: float, gpio_pin: int) -> float:
+    def _poll_loop(self):
         """
-        Check if a valid signal was received and trigger callback.
+        Background thread: poll both pins using wait_for_edge.
 
-        Two detection modes:
-        1. Edge burst: ≥MIN_EDGES edges within BURST_WINDOW_S (OOK data stream)
-        2. Falling hold: current pin is LOW for >50ms after first edge (VT pulse)
-
-        Returns updated last_ts.
+        Detects edges on either pin, records timestamps, and checks
+        for valid RF bursts using burst-count or falling-hold modes.
         """
-        now = time.time()
+        while self._running:
+            try:
+                # Block until edge on either pin, with timeout for _running check
+                channel = self._gpio.wait_for_edge(
+                    self.lock_pin, self._gpio.BOTH,
+                    timeout=self.EDGE_TIMEOUT_MS
+                )
+                if channel is None:
+                    continue  # timeout, re-check _running
+
+                now = time.time()
+
+                if channel == self.lock_pin:
+                    self._record_edge(now, self._lock_edges, self._lock_mutex)
+                    self._last_lock_ts = self._check_trigger(
+                        "LOCK", self._lock_edges, self._lock_mutex,
+                        self._last_lock_ts, self.lock_pin
+                    )
+                elif channel == self.unlock_pin:
+                    self._record_edge(now, self._unlock_edges, self._unlock_mutex)
+                    self._last_unlock_ts = self._check_trigger(
+                        "UNLOCK", self._unlock_edges, self._unlock_mutex,
+                        self._last_unlock_ts, self.unlock_pin
+                    )
+
+                # Poll the other pin non-blocking too
+                if self._running:
+                    try:
+                        channel2 = self._gpio.wait_for_edge(
+                            self.unlock_pin, self._gpio.BOTH,
+                            timeout=1
+                        )
+                        if channel2 == self.unlock_pin:
+                            now2 = time.time()
+                            self._record_edge(now2, self._unlock_edges, self._unlock_mutex)
+                            self._last_unlock_ts = self._check_trigger(
+                                "UNLOCK", self._unlock_edges, self._unlock_mutex,
+                                self._last_unlock_ts, self.unlock_pin
+                            )
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                logger.error("RF poll loop error: %s", exc)
+                time.sleep(0.1)
+
+    def _record_edge(self, now: float, edges: list, mutex: threading.Lock):
         with mutex:
+            edges.append(now)
             while edges and (now - edges[0]) > self.BURST_WINDOW_S:
                 edges.pop(0)
+
+    def _check_trigger(self, pin_name: str, edges: list, mutex: threading.Lock,
+                       last_ts: float, gpio_pin: int) -> float:
+        now = time.time()
+        if (now - last_ts) < self.DEBOUNCE_S:
+            return last_ts
+
+        with mutex:
             edge_count = len(edges)
 
-        # Mode 1: edge burst detected
-        if edge_count >= self.MIN_EDGES and (now - last_ts) > self.DEBOUNCE_S:
+        # Mode 1: edge burst (OOK data stream)
+        if edge_count >= self.MIN_EDGES:
             logger.info("RF: %s pressed (%d edges in %.0fms)",
                         pin_name, edge_count, self.BURST_WINDOW_S * 1000)
             with mutex:
@@ -171,16 +181,15 @@ class RFReceiver:
                 self._callback(pin_name)
             return now
 
-        # Mode 2: falling-edge hold (pin is LOW, has been for a while)
-        if edge_count >= 1 and (now - last_ts) > self.DEBOUNCE_S:
+        # Mode 2: falling hold (pin stays LOW >50ms)
+        if edge_count >= 1:
             try:
                 pin_val = bool(self._gpio.input(gpio_pin))
             except Exception:
-                pin_val = True  # assume HIGH on error, don't trigger
+                pin_val = True
             if not pin_val:
-                # Pin is LOW and has been for >=1 edge cycle + debounce check
                 hold_time = now - edges[0]
-                if hold_time > 0.05:  # held LOW for >50ms
+                if hold_time > 0.05:
                     logger.info("RF: %s pressed (VT hold %.0fms, %d edges)",
                                 pin_name, hold_time * 1000, edge_count)
                     with mutex:
@@ -190,29 +199,3 @@ class RFReceiver:
                     return now
 
         return last_ts
-
-    def _on_lock_edge(self, channel):
-        """Callback on any GPIO edge change on LOCK pin."""
-        with self._lock_mutex:
-            self._lock_edges.append(time.time())
-        self._last_lock_ts = self._check_and_trigger(
-            "LOCK", self._lock_edges, self._lock_mutex,
-            self._last_lock_ts, self.lock_pin
-        )
-
-    def _on_unlock_edge(self, channel):
-        """Callback on any GPIO edge change on UNLOCK pin."""
-        with self._unlock_mutex:
-            self._unlock_edges.append(time.time())
-        self._last_unlock_ts = self._check_and_trigger(
-            "UNLOCK", self._unlock_edges, self._unlock_mutex,
-            self._last_unlock_ts, self.unlock_pin
-        )
-
-    def _keep_alive(self):
-        """Keep this object alive so edge detection callbacks can fire."""
-        while self._running:
-            try:
-                time.sleep(0.5)
-            except Exception:
-                break
