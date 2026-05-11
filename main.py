@@ -29,6 +29,7 @@ try:
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
     from rf_receiver import RFReceiver
+    from ir_liveness import IRLivenessDetector
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -41,7 +42,7 @@ from logger import ActivityLogger
 # ── Constants ───────────────────────────────────────────────────────────
 FRAME_RATE = 15.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
-MAX_COLLECT_FRAMES = 15        # ~1s window — MiniFASNet is single-frame
+MAX_COLLECT_FRAMES = 15        # reserved for potential multi-frame scoring
 UNLOCK_DURATION = 3.0
 MATCH_THRESHOLD = 0.6
 
@@ -85,13 +86,14 @@ class FaceDoorSystem:
         self.buzzer = None
         self.face_storage = None
         self.face_recognizer = None
-        self.liveness = None
+        self.ir_liveness = None
         self.bt_server = None
         self.logger = None
         self.rf_receiver = None
 
         # Persistent lock state (RF remote / BT manual override)
         self._lock_state = "locked"  # "locked" | "unlocked"
+        self._ir_face_rect = None
 
         # RF learn mode
         self._rf_learning = None
@@ -136,6 +138,9 @@ class FaceDoorSystem:
         self.face_storage = FaceStorage()
         self.face_recognizer = FaceRecognizer()
         self.logger = ActivityLogger()
+
+        # NoIR spectral liveness detection (single-frame, no external LED needed)
+        self.ir_liveness = IRLivenessDetector()
 
         self.bt_server = BluetoothServer()
         if not self.bt_server.start():
@@ -471,8 +476,12 @@ class FaceDoorSystem:
                                [f"Door: {self._lock_state.upper()}"])
 
         if face_locations:
-            print("[Main] Face detected — going to COMPARE")
-            self.state = State.COMPARE
+            print("[Main] Face detected — NoIR spectral liveness check via COLLECTING")
+            # Store the largest face rect for spectral crop
+            self._ir_face_rect = max(face_locations,
+                                     key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
+            self._liveness_frames = []  # reset for spectral capture
+            self.state = State.COLLECTING
             return
 
         # Non-blocking BT client accept
@@ -485,69 +494,72 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    #    ── State: COLLECTING ────────────────────────────────────────────
+    # ── State: COLLECTING (single-frame for NoIR spectral analysis) ──
     def _state_collecting(self):
-        """Collect frames and run MiniFASNet anti-spoof scoring. Exits early on passed liveness."""
+        """Capture a single frame for NoIR spectral liveness detection.
+
+        Uses the Pi NoIR camera's inherent IR sensitivity (no IR-cut filter)
+        to analyze the spectral signature of the face region.
+        Goes to LIVENESS_CHECK after capture.
+        """
         frame = self.camera.capture_frame()
         if frame is None:
+            print("[Main] COLLECTING: frame capture failed")
+            self.state = State.SCANNING
             return
 
+        self._liveness_frames = [frame]
         self._latest_frame = frame
-        self._liveness_frames.append(frame)
-        self._frame_count += 1
 
-        # Process frame for MiniFASNet anti-spoof
-        lr = self.liveness.process_frame(frame)
+        print("[Main] Frame captured — running NoIR spectral liveness")
+        self._show_preview(frame, "NOIR LIVENESS — ANALYZING",
+                           ["Single-frame spectral analysis"])
+        self.state = State.LIVENESS_CHECK
 
-        # Every 5 frames, verify face is still visible
-        if len(self._liveness_frames) % 5 == 0:
-            faces = self.face_recognizer.detect_faces(frame)
-            self._last_face_locations = faces
-            if not faces:
-                print("[Main] Face lost during collection — resetting to SCANNING")
-                self._liveness_frames = []
-                self.liveness.reset()
-                self.state = State.SCANNING
-                return
+    # ── State: LIVENESS_CHECK (NoIR spectral analysis) ────────────────
+    def _state_liveness_check(self):
+        """Run NoIR spectral liveness analysis on the captured frame.
 
-        # Show preview with progress
-        progress = len(self._liveness_frames)
-        self._show_preview(frame, "COLLECTING",
-                           [f"Frame {progress}/{MAX_COLLECT_FRAMES}  Score: {lr['score']:.3f}"])
+        Analyzes the R/G/B channel balance in the face region to distinguish
+        live skin (R channel boosted by NIR bleed) from photos/screens.
+        """
+        if not self._liveness_frames:
+            print("[Main] No frame for liveness analysis — rejecting")
+            self.state = State.REJECTED
+            return
 
-        # Early exit: enough frames with high liveness score
-        if lr['passed']:
-            print(f"[Main] Liveness PASSED — score={lr['score']:.3f} at frame {progress}")
+        frame = self._liveness_frames[0]
+
+        if not hasattr(self, '_ir_face_rect') or self._ir_face_rect is None:
+            print("[Main] No face rect for spectral analysis — falling back to COMPARE")
             self.state = State.COMPARE
             return
 
-        # Timeout: too long without passing liveness
-        if len(self._liveness_frames) >= MAX_COLLECT_FRAMES:
-            print(f"[Main] Liveness FAILED — score={lr['score']:.3f} in {MAX_COLLECT_FRAMES} frames")
-            self.state = State.REJECTED
-
-    # ── State: LIVENESS_CHECK ────────────────────────────────────────
-    def _state_liveness_check(self):
-        """Run MiniFASNet batch liveness check on collected frames."""
-        print("[Main] Running liveness check...")
+        print("[Main] Analyzing NoIR spectral liveness...")
         try:
-            result = self.liveness.check_liveness(self._liveness_frames)
+            result = self.ir_liveness.check_liveness(frame, self._ir_face_rect)
+            passed = result['passed']
             score = result['score']
+            red_dom = result['red_dominance']
+            red_excess = result['red_excess']
             details = result.get('details', '')
-            print(f"[Main]   Liveness score={score:.2f}")
-            if result['passed']:
-                print(f"[Main] Liveness PASSED (score={score:.3f})")
-                self._show_preview(self._latest_frame, "LIVENESS PASSED ✅",
-                                   [f"Score: {score:.2f}", details])
+
+            print(f"[Main]   R/(G+B)={red_dom:.3f}, red_excess={red_excess:.3f}, score={score:.3f}")
+
+            if passed:
+                print(f"[Main] NOIR SPECTRAL LIVENESS PASSED ✅ (score={score:.3f})")
+                self._show_preview(frame, "NOIR LIVENESS PASSED ✅",
+                                   [f"Score: {score:.3f}", f"R/(G+B): {red_dom:.3f}", details])
+                time.sleep(0.5)
                 self.state = State.COMPARE
             else:
-                print(f"[Main] Liveness FAILED (score={score:.3f})")
-                self._show_preview(self._latest_frame, "LIVENESS FAILED ❌",
-                                   [f"Score: {score:.2f}", details])
+                print(f"[Main] NOIR SPECTRAL LIVENESS FAILED ❌ (score={score:.3f})")
+                self._show_preview(frame, "NOIR LIVENESS FAILED ❌",
+                                   [f"Score: {score:.3f}", f"R/(G+B): {red_dom:.3f}", details])
                 time.sleep(1)
                 self.state = State.REJECTED
         except Exception as e:
-            print(f"[Main] Liveness check error: {e}")
+            print(f"[Main] NoIR spectral liveness error: {e}")
             traceback.print_exc()
             self.state = State.REJECTED
 
@@ -631,6 +643,7 @@ class FaceDoorSystem:
                 time.sleep(0.2)
 
         self._liveness_frames = []
+        self._ir_face_rect = None
         self.state = State.SCANNING
 
     # ── State: REJECTED ──────────────────────────────────────────────
@@ -654,6 +667,7 @@ class FaceDoorSystem:
             time.sleep(1)
 
         self._liveness_frames = []
+        self._ir_face_rect = None
         self.state = State.SCANNING
 
     # ── Main Loop ────────────────────────────────────────────────────
