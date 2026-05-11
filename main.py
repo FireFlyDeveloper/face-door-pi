@@ -163,7 +163,11 @@ class FaceDoorSystem:
         """Annotate frame with status info and show in cv2 window."""
         if frame is None or not self._show_preview_enabled:
             return
-        display = frame.copy()
+        # Convert grayscale to BGR for colored annotations
+        if frame.ndim == 2:
+            display = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            display = frame.copy()
         h, w = display.shape[:2]
 
         # Draw state label at top
@@ -194,15 +198,15 @@ class FaceDoorSystem:
             # Toggle debug overlay with distance/match info
             self._show_debug = not getattr(self, '_show_debug', False)
 
-    # ── Helper: decode base64 image to np.ndarray (BGR) ────────────
+    # ── Helper: decode base64 image to np.ndarray (grayscale) ────
     @staticmethod
-    def _b64_to_bgr(b64_str):
-        """Decode a base64 JPEG string to a BGR numpy array."""
+    def _b64_to_gray(b64_str):
+        """Decode a base64 JPEG string to a grayscale numpy array."""
         img_bytes = base64.b64decode(b64_str)
         pil_image = Image.open(io.BytesIO(img_bytes))
         rgb = np.array(pil_image)
-        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-        return bgr
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        return gray
 
     # ── Bluetooth Command Handler ────────────────────────────────────
     def _handle_bt_command(self, command):
@@ -225,7 +229,7 @@ class FaceDoorSystem:
 
             try:
                 # Decode base64 images to numpy arrays
-                images = [self._b64_to_bgr(b64) for b64 in images_b64]
+                images = [self._b64_to_gray(b64) for b64 in images_b64]
 
                 # Register face: get averaged encoding from all valid images
                 avg_encoding = self.face_recognizer.register_face(images)

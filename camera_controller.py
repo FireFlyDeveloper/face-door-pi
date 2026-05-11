@@ -1,7 +1,6 @@
-"""
-camera_controller.py — Pi Camera v2 control via picamera2.
+"""camera_controller.py — Pi Camera v2 control via picamera2.
 
-Provides CameraController class for capturing frames in BGR format (OpenCV-compatible).
+Provides CameraController class for capturing frames in grayscale format.
 Supports context manager, single frame, and burst capture at ~30fps.
 """
 
@@ -69,20 +68,20 @@ class CameraController:
 
     def capture_frame(self) -> Optional[np.ndarray]:
         """
-        Capture a single frame.
+        Capture a single frame as grayscale.
 
         Returns:
-            np.ndarray in BGR format (H x W x 3), or None on failure.
+            np.ndarray in grayscale (H x W), or None on failure.
         """
         if self._camera is None:
             logger.warning("Camera not started — call start() first.")
             return None
 
         try:
-            # picamera2 returns RGB888 — convert to BGR for OpenCV
+            # picamera2 returns RGB888 — convert to grayscale
             rgb = self._camera.capture_array()
-            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            return bgr
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            return gray
         except Exception as exc:
             logger.error("Failed to capture frame: %s", exc)
             return None
@@ -105,8 +104,8 @@ class CameraController:
         for i in range(count):
             try:
                 rgb = self._camera.capture_array()
-                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                frames.append(bgr)
+                gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+                frames.append(gray)
             except Exception as exc:
                 logger.error("Failed to capture frame %d/%d: %s", i + 1, count, exc)
                 break  # stop early on persistent error
