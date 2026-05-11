@@ -1,190 +1,140 @@
 """
-rf_receiver.py — 433MHz RF remote receiver for manual lock/unlock.
+rf_receiver.py — Two-button 433MHz remote via direct GPIO edge detection.
 
-Monitors a 433MHz receiver module on a configurable GPIO pin and decodes
-common 433MHz protocols (PT2262, SC5262, etc.) via the rpi-rf library.
+Two separate receiver modules (or a dual-channel receiver) each output to
+a dedicated GPIO pin. Rising-edge detection triggers the corresponding
+callback — no rpi-rf code decoding needed.
 
-Maps received codes to LOCK / UNLOCK actions. Supports a learn mode
-to capture remote button codes at runtime.
+GPIO mapping:
+  lock_pin   (default GPIO22) → LOCK action
+  unlock_pin (default GPIO23) → UNLOCK action
+
+Pull-down resistors ensure stable LOW when no button is pressed.
+Debounce of ~100ms prevents false triggers from RF noise.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import threading
-import time
 import logging
+import time
 from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-# ── Lazy rpi-rf import ───────────────────────────────────────────────
-_RF_AVAILABLE = False
-RFDevice = None
+_GPIO: Optional[type] = None
 
-try:
-    from rpi_rf import RFDevice as _RFDevice
 
-    _RF_AVAILABLE = True
-    RFDevice = _RFDevice
-except ImportError:
-    logger.warning(
-        "rpi-rf not installed. 433MHz receiver disabled. "
-        "Install: pip3 install rpi-rf"
-    )
-
-# ── Default config path ─────────────────────────────────────────────
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "rf_codes.json")
+def _get_gpio():
+    global _GPIO
+    if _GPIO is None:
+        try:
+            import RPi.GPIO as GPIO
+            _GPIO = GPIO
+        except (ImportError, RuntimeError) as exc:
+            logger.warning("RPi.GPIO not available: %s", exc)
+            return None
+    return _GPIO
 
 
 class RFReceiver:
-    """
-    Listens to a 433MHz receiver on *pin* (BCM).
-    Calls *callback* with 'LOCK' or 'UNLOCK' when a known code arrives.
+    """Two-button 433MHz remote via direct GPIO edge detection.
 
-    Known codes are stored in rf_codes.json:
-        {"lock": 1234567, "unlock": 7654321, "pulselen": 350}
+    Attributes:
+        lock_pin:   GPIO reading LOCK button receiver output.
+        unlock_pin: GPIO reading UNLOCK button receiver output.
+        is_configured: Always True (no code learning needed).
     """
 
-    def __init__(
-        self,
-        pin: int = 22,
-        config_path: str = CONFIG_PATH,
-    ):
-        self.pin = pin
-        self.config_path = config_path
-        self._callback: Optional[Callable[[str], None]] = None  # arg: 'LOCK' | 'UNLOCK'
-        self._learn_callback: Optional[Callable[[int, int], None]] = None  # arg: code, pulselen
-        self._device: Optional[RFDevice] = None
-        self._thread: Optional[threading.Thread] = None
+    DEBOUNCE_MS = 150  # minimum interval between triggers
+
+    def __init__(self, lock_pin: int = 22, unlock_pin: int = 23):
+        self.lock_pin = lock_pin
+        self.unlock_pin = unlock_pin
+        self._gpio = _get_gpio()
+        self._callback: Optional[Callable[[str], None]] = None
         self._running = False
+        self._last_lock_ts = 0.0
+        self._last_unlock_ts = 0.0
+        self.is_configured = True  # always ready
 
-        # Load known codes
-        self._lock_code: Optional[int] = None
-        self._unlock_code: Optional[int] = None
-        self._pulselen: Optional[int] = None
-        self._load_codes()
-
-    # ── Public API ───────────────────────────────────────────────────
+        if self._gpio is not None:
+            try:
+                self._gpio.setmode(self._gpio.BCM)
+                self._gpio.setwarnings(False)
+                self._gpio.setup(self.lock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
+                self._gpio.setup(self.unlock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
+                logger.info(
+                    "RF receiver: LOCK=GPIO%d, UNLOCK=GPIO%d (pull-down)",
+                    self.lock_pin, self.unlock_pin,
+                )
+            except Exception as exc:
+                logger.error("Failed to init RF GPIOs: %s", exc)
+                self._gpio = None
+        else:
+            logger.warning("RPi.GPIO unavailable — RF receiver disabled")
 
     def set_callback(self, cb: Callable[[str], None]):
-        """Receive 'LOCK' or 'UNLOCK' when a known RF code arrives."""
+        """Set callback receiving 'LOCK' or 'UNLOCK' on button press."""
         self._callback = cb
 
-    def set_learn_callback(self, cb: Callable[[int, int], None]):
-        """
-        Receive (code, pulselen) for *any* RF burst.
-        Used during learn mode to discover remote button codes.
-        """
-        self._learn_callback = cb
-
     def start(self) -> bool:
-        """Start the RF receiver thread. Returns True if started."""
-        if not _RF_AVAILABLE or RFDevice is None:
-            logger.warning("rpi-rf unavailable — RF receiver not started")
+        """Attach rising-edge interrupts for both pins. Returns True on success."""
+        if self._gpio is None:
             return False
-
         try:
-            self._device = RFDevice(self.pin)
-            self._device.enable_rx()
             self._running = True
-            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
-            self._thread.start()
-            logger.info("RF receiver started on GPIO%d", self.pin)
+            self._gpio.add_event_detect(
+                self.lock_pin, self._gpio.RISING,
+                callback=self._lock_handler, bouncetime=self.DEBOUNCE_MS,
+            )
+            self._gpio.add_event_detect(
+                self.unlock_pin, self._gpio.RISING,
+                callback=self._unlock_handler, bouncetime=self.DEBOUNCE_MS,
+            )
+            logger.info("RF edge detection started (LOCK=GPIO%d, UNLOCK=GPIO%d)",
+                        self.lock_pin, self.unlock_pin)
             return True
         except Exception as exc:
-            logger.error("Failed to start RF receiver on GPIO%d: %s", self.pin, exc)
+            logger.error("Failed to start RF edge detection: %s", exc)
+            self._running = False
             return False
 
     def stop(self):
-        """Stop the RF receiver and clean up."""
+        """Remove event detection and clean up."""
         self._running = False
-        if self._thread:
-            self._thread.join(timeout=2)
-        if self._device:
-            try:
-                self._device.cleanup()
-            except Exception:
-                pass
+        if self._gpio is None:
+            return
+        try:
+            self._gpio.remove_event_detect(self.lock_pin)
+        except Exception:
+            pass
+        try:
+            self._gpio.remove_event_detect(self.unlock_pin)
+        except Exception:
+            pass
+        try:
+            self._gpio.cleanup(self.lock_pin)
+            self._gpio.cleanup(self.unlock_pin)
+        except Exception:
+            pass
         logger.info("RF receiver stopped")
 
-    def save_code(self, code: int, pulselen: int, action: str):
-        """
-        Save a learned code to rf_codes.json.
+    # ── Internal handlers ──────────────────────────────────────────
 
-        Args:
-            code: The RF code value.
-            pulselen: Pulse length in microseconds.
-            action: 'lock' or 'unlock'.
-        """
-        codes = self._load_raw()
-        codes[action] = code
-        codes["pulselen"] = pulselen
-        self._save_raw(codes)
-        self._lock_code = codes.get("lock")
-        self._unlock_code = codes.get("unlock")
-        self._pulselen = codes.get("pulselen")
-        logger.info("Saved RF code %d → %s", code, action)
+    def _lock_handler(self, channel: int):
+        now = time.time()
+        if (now - self._last_lock_ts) * 1000 < self.DEBOUNCE_MS:
+            return
+        self._last_lock_ts = now
+        logger.info("RF: LOCK button pressed")
+        if self._callback:
+            self._callback("LOCK")
 
-    @property
-    def is_configured(self) -> bool:
-        """True if both lock and unlock codes are configured."""
-        return self._lock_code is not None and self._unlock_code is not None
-
-    # ── Internal ─────────────────────────────────────────────────────
-
-    def _load_codes(self):
-        codes = self._load_raw()
-        self._lock_code = codes.get("lock")
-        self._unlock_code = codes.get("unlock")
-        self._pulselen = codes.get("pulselen")
-
-    def _load_raw(self) -> dict:
-        try:
-            with open(self.config_path) as f:
-                return json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
-    def _save_raw(self, codes: dict):
-        os.makedirs(os.path.dirname(self.config_path) or ".", exist_ok=True)
-        with open(self.config_path, "w") as f:
-            json.dump(codes, f, indent=2)
-
-    def _poll_loop(self):
-        """Background thread: poll RF device for new codes."""
-        device = self._device
-        last_ts = 0
-
-        while self._running:
-            try:
-                ts = device.rx_code_timestamp
-                if ts != 0 and ts != last_ts:
-                    last_ts = ts
-                    code = device.rx_code
-                    pulselen = device.rx_pulselen
-                    self._handle_code(code, pulselen)
-                time.sleep(0.02)  # 50 Hz poll
-            except Exception as exc:
-                logger.debug("RF poll error: %s", exc)
-                time.sleep(0.1)
-
-    def _handle_code(self, code: int, pulselen: int):
-        """Route a received code to the appropriate handler."""
-        # Always notify learn callback if set (learn mode)
-        if self._learn_callback:
-            self._learn_callback(code, pulselen)
-            return  # don't map during learn mode
-
-        # Map known codes
-        if self._lock_code is not None and code == self._lock_code:
-            logger.info("RF: LOCK code received")
-            if self._callback:
-                self._callback("LOCK")
-        elif self._unlock_code is not None and code == self._unlock_code:
-            logger.info("RF: UNLOCK code received")
-            if self._callback:
-                self._callback("UNLOCK")
-        else:
-            logger.info("RF: unknown code %d (pulselen=%d)", code, pulselen)
+    def _unlock_handler(self, channel: int):
+        now = time.time()
+        if (now - self._last_unlock_ts) * 1000 < self.DEBOUNCE_MS:
+            return
+        self._last_unlock_ts = now
+        logger.info("RF: UNLOCK button pressed")
+        if self._callback:
+            self._callback("UNLOCK")
