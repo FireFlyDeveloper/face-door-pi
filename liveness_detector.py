@@ -157,7 +157,7 @@ class LivenessDetector:
 
         passed = (
             self._frame_count >= MIN_FRAMES and
-            self._smooth_score >= SCORE_THRESHOLD
+            round(self._smooth_score, 3) >= SCORE_THRESHOLD
         )
 
         print_attack = float(probs[1])
@@ -185,7 +185,7 @@ class LivenessDetector:
             scores.append(result['score'])
 
         avg_score = np.mean(scores) if scores else 0.0
-        passed = len(scores) >= MIN_FRAMES and avg_score >= SCORE_THRESHOLD
+        passed = len(scores) >= MIN_FRAMES and round(avg_score, 3) >= SCORE_THRESHOLD
 
         return {
             'passed': passed,
