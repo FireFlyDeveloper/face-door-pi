@@ -104,14 +104,21 @@ class RFReceiver:
         self._callback = cb
 
     def start(self) -> bool:
-        """Start the edge-detection background thread. Returns True on success."""
+        """Register GPIO edge detection and start keepalive thread. Returns True on success."""
         if self._gpio is None:
             return False
         try:
+            # Register edge detection on the MAIN thread (RPi.GPIO requirement)
+            self._gpio.add_event_detect(self.lock_pin, self._gpio.BOTH,
+                                        callback=self._on_lock_edge)
+            self._gpio.add_event_detect(self.unlock_pin, self._gpio.BOTH,
+                                        callback=self._on_unlock_edge)
+
+            # Keepalive thread (only keeps the Python process from exiting)
             self._running = True
-            self._thread = threading.Thread(target=self._run_edge_detect, daemon=True)
+            self._thread = threading.Thread(target=self._keep_alive, daemon=True)
             self._thread.start()
-            logger.info("RF edge-detect thread started (LOCK=GPIO%d, UNLOCK=GPIO%d)",
+            logger.info("RF edge detection active on GPIO%d, GPIO%d",
                         self.lock_pin, self.unlock_pin)
             return True
         except Exception as exc:
@@ -202,22 +209,8 @@ class RFReceiver:
             self._last_unlock_ts, self.unlock_pin
         )
 
-    def _run_edge_detect(self):
-        """Background thread: set up edge detection callbacks and keep alive."""
-        try:
-            self._gpio.add_event_detect(self.lock_pin, self._gpio.BOTH,
-                                        callback=self._on_lock_edge)
-            self._gpio.add_event_detect(self.unlock_pin, self._gpio.BOTH,
-                                        callback=self._on_unlock_edge)
-        except Exception as exc:
-            logger.error("Failed to add edge detection: %s", exc)
-            self._running = False
-            return
-
-        logger.info("RF edge detection active on GPIO%d, GPIO%d",
-                    self.lock_pin, self.unlock_pin)
-
-        # Keep thread alive; callbacks fire from a separate RPi.GPIO thread
+    def _keep_alive(self):
+        """Keep this object alive so edge detection callbacks can fire."""
         while self._running:
             try:
                 time.sleep(0.5)
