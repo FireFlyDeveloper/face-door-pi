@@ -100,7 +100,7 @@ class LivenessDetector:
         Process a single frame for anti-spoof.
 
         Args:
-            frame: Grayscale numpy array (H x W).
+            frame: BGR numpy array.
 
         Returns:
             dict with: passed, score, liveness_score, face_detected, details.
@@ -108,8 +108,8 @@ class LivenessDetector:
         self._ensure_models()
         self._frame_count += 1
 
-        # Frame is already grayscale — use directly for dlib
-        faces = self._detector(frame, 0)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces = self._detector(gray, 0)
 
         if not faces:
             self._smooth_score = 0.5
@@ -132,9 +132,8 @@ class LivenessDetector:
                 'details': 'crop too small',
             }
 
-        # Preprocess: grayscale → pseudo 3-channel → resize → normalize → NCHW
-        three_ch = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
-        resized = cv2.resize(three_ch, (INPUT_SIZE, INPUT_SIZE))
+        # Preprocess: resize → normalize → NCHW
+        resized = cv2.resize(crop, (INPUT_SIZE, INPUT_SIZE))
         normalized = resized.astype(np.float32) / 255.0
         nchw = np.transpose(normalized, (2, 0, 1))  # HWC → CHW
         batch = np.expand_dims(nchw, axis=0)         # → NCHW

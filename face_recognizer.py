@@ -195,10 +195,7 @@ class FaceRecognizer:
 
     @staticmethod
     def _to_rgb(image: np.ndarray) -> np.ndarray:
-        """Convert grayscale or BGR to 3-channel RGB for dlib."""
-        if image.ndim == 2:
-            # Grayscale (H x W) → stack to 3-channel RGB
-            return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        """Convert BGR (OpenCV default) to RGB (dlib default)."""
         if image.shape[2] == 3:
             return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return image
