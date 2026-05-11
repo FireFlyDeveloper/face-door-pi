@@ -142,7 +142,8 @@ class FaceDoorSystem:
             print("[Main] Bluetooth server failed to start, continuing without BT")
 
         # 433MHz RF receiver — two-button direct GPIO edge detection
-        self.rf_receiver = RFReceiver(lock_pin=22, unlock_pin=23)
+        self.rf_receiver = RFReceiver(lock_pin=22, unlock_pin=23,
+                                         lock_polarity='rising', unlock_polarity='falling')
         self.rf_receiver.set_callback(self._handle_rf_command)
         if self.rf_receiver.start():
             print("[Main] RF receiver active — LOCK=GPIO22 UNLOCK=GPIO23")

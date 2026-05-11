@@ -39,6 +39,8 @@ def _get_gpio():
 class RFReceiver:
     """Two-button 433MHz remote via GPIO polling thread.
 
+    Supports per-pin polarity: 'rising' (LOW→HIGH) or 'falling' (HIGH→LOW).
+
     Attributes:
         lock_pin:   GPIO reading LOCK button receiver output.
         unlock_pin: GPIO reading UNLOCK button receiver output.
@@ -48,9 +50,19 @@ class RFReceiver:
     POLL_INTERVAL = 0.02   # 50 Hz poll rate
     DEBOUNCE_S = 0.15      # minimum interval between triggers
 
-    def __init__(self, lock_pin: int = 22, unlock_pin: int = 23):
+    def __init__(self, lock_pin: int = 22, unlock_pin: int = 23,
+                 lock_polarity: str = 'rising', unlock_polarity: str = 'falling'):
+        """
+        Args:
+            lock_pin: GPIO for LOCK receiver data pin.
+            unlock_pin: GPIO for UNLOCK receiver data pin.
+            lock_polarity: 'rising' (LOW→HIGH) or 'falling' (HIGH→LOW).
+            unlock_polarity: 'rising' or 'falling'.
+        """
         self.lock_pin = lock_pin
         self.unlock_pin = unlock_pin
+        self._lock_polarity = lock_polarity
+        self._unlock_polarity = unlock_polarity
         self._gpio = _get_gpio()
         self._callback: Optional[Callable[[str], None]] = None
         self._running = False
@@ -113,13 +125,14 @@ class RFReceiver:
     def _poll_loop(self):
         """Background thread: poll both GPIOs at POLL_INTERVAL rate.
 
-        Uses transition detection (LOW→HIGH) instead of level detection,
-        so a stuck-HIGH receiver module won't trigger repeatedly.
+        Uses transition detection with per-pin polarity:
+          'rising'  → fires on LOW→HIGH
+          'falling' → fires on HIGH→LOW
         """
         prev_lock = False
         prev_unlock = False
 
-        # Quick initial read to match prev state and avoid false trigger on first poll
+        # Quick initial read to avoid false trigger on first poll
         try:
             prev_lock = bool(self._gpio.input(self.lock_pin))
             prev_unlock = bool(self._gpio.input(self.unlock_pin))
@@ -131,21 +144,27 @@ class RFReceiver:
             curr_lock = bool(self._gpio.input(self.lock_pin))
             curr_unlock = bool(self._gpio.input(self.unlock_pin))
 
-            # ── LOCK: LOW→HIGH transition ─────────────────────────
-            if curr_lock and not prev_lock:
-                if (now - self._last_lock_ts) > self.DEBOUNCE_S:
-                    self._last_lock_ts = now
-                    logger.info("RF: LOCK button pressed")
-                    if self._callback:
-                        self._callback("LOCK")
+            # ── LOCK ─────────────────────────────────────────────
+            if self._lock_polarity == 'falling':
+                lock_active = prev_lock and not curr_lock   # HIGH→LOW
+            else:
+                lock_active = curr_lock and not prev_lock   # LOW→HIGH
+            if lock_active and (now - self._last_lock_ts) > self.DEBOUNCE_S:
+                self._last_lock_ts = now
+                logger.info("RF: LOCK button pressed")
+                if self._callback:
+                    self._callback("LOCK")
 
-            # ── UNLOCK: LOW→HIGH transition ───────────────────────
-            if curr_unlock and not prev_unlock:
-                if (now - self._last_unlock_ts) > self.DEBOUNCE_S:
-                    self._last_unlock_ts = now
-                    logger.info("RF: UNLOCK button pressed")
-                    if self._callback:
-                        self._callback("UNLOCK")
+            # ── UNLOCK ───────────────────────────────────────────
+            if self._unlock_polarity == 'falling':
+                unlock_active = prev_unlock and not curr_unlock   # HIGH→LOW
+            else:
+                unlock_active = curr_unlock and not prev_unlock   # LOW→HIGH
+            if unlock_active and (now - self._last_unlock_ts) > self.DEBOUNCE_S:
+                self._last_unlock_ts = now
+                logger.info("RF: UNLOCK button pressed")
+                if self._callback:
+                    self._callback("UNLOCK")
 
             prev_lock = curr_lock
             prev_unlock = curr_unlock
