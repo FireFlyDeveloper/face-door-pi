@@ -141,9 +141,8 @@ class FaceDoorSystem:
         if not self.bt_server.start():
             print("[Main] Bluetooth server failed to start, continuing without BT")
 
-        # 433MHz RF receiver — two-button direct GPIO edge detection
-        self.rf_receiver = RFReceiver(lock_pin=22, unlock_pin=23,
-                                         lock_polarity='rising', unlock_polarity='rising')
+        # 433MHz RF receiver — two-button edge-detection with pulse timing
+        self.rf_receiver = RFReceiver(lock_pin=22, unlock_pin=23)
         self.rf_receiver.set_callback(self._handle_rf_command)
         if self.rf_receiver.start():
             print("[Main] RF receiver active — LOCK=GPIO22 UNLOCK=GPIO23")
@@ -623,25 +622,6 @@ class FaceDoorSystem:
             self.cleanup()
             return
 
-        # Direct GPIO polling for RF remote (bypasses RFReceiver daemon thread)
-        self._rf_lock_state = False
-        self._rf_unlock_state = False
-        self._rf_last_lock_ts = 0.0
-        self._rf_last_unlock_ts = 0.0
-        # Read initial GPIO states to prevent false trigger on first poll
-        try:
-            import RPi.GPIO as GPIO
-            if not GPIO.getmode():
-                GPIO.setmode(GPIO.BCM)
-                GPIO.setwarnings(False)
-                GPIO.setup(22, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-                GPIO.setup(23, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
-            self._rf_lock_state = bool(GPIO.input(22))
-            self._rf_unlock_state = bool(GPIO.input(23))
-            print(f"[Main] Initial GPIO: GPIO22={int(self._rf_lock_state)} GPIO23={int(self._rf_unlock_state)}")
-        except Exception as e:
-            print(f"[Main] GPIO init error: {e}")
-
         self.state = State.SCANNING
         print(f"[Main] Entering auto-scan loop at ~{FRAME_RATE}fps")
 
@@ -673,31 +653,6 @@ class FaceDoorSystem:
             sleep_time = FRAME_INTERVAL - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
-
-            # Direct GPIO RF remote polling (bypasses daemon thread issues)
-            try:
-                import RPi.GPIO as GPIO
-                curr_lock = bool(GPIO.input(22))
-                curr_unlock = bool(GPIO.input(23))
-                now = time.time()
-                # Detect ANY change on LOCK pin (rising from LOW→HIGH)
-                if curr_lock and not self._rf_lock_state and (now - self._rf_last_lock_ts) > 0.15:
-                    self._rf_last_lock_ts = now
-                    print(f"[RF-DIRECT] GPIO22=LOCK pressed (val={int(curr_lock)})")
-                    self._handle_rf_command("LOCK")
-                # Detect ANY change on UNLOCK pin (falling from HIGH→LOW or rising if it dips)
-                if curr_unlock != self._rf_unlock_state and (now - self._rf_last_unlock_ts) > 0.15:
-                    self._rf_last_unlock_ts = now
-                    print(f"[RF-DIRECT] GPIO23={curr_unlock} UNLOCK change detected")
-                    if not curr_unlock:
-                        print(f"[RF-DIRECT] GPIO23 went LOW — triggering UNLOCK")
-                        self._handle_rf_command("UNLOCK")
-                    else:
-                        print(f"[RF-DIRECT] GPIO23 went HIGH — ignoring (idle state)")
-                self._rf_lock_state = curr_lock
-                self._rf_unlock_state = curr_unlock
-            except Exception as e:
-                pass
 
             # Process BT messages during all states
             self._process_bt_client()

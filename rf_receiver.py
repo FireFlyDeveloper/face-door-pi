@@ -1,15 +1,14 @@
 """
-rf_receiver.py — Two-button 433MHz remote via GPIO polling thread.
+rf_receiver.py — 433MHz OOK remote receiver using GPIO edge-detection timing.
 
-Uses a background polling thread instead of RPi.GPIO edge detection,
-which can be unreliable with noisy 433MHz OOK data stream signals.
+Uses RPi.GPIO edge detection (BOTH edges) to capture pulse-width timings
+from a generic 433MHz OOK receiver module (FS1000A / MX-05V / XY-MK-5V).
 
-GPIO mapping:
-  lock_pin   (default GPIO22) → LOCK action
-  unlock_pin (default GPIO23) → UNLOCK action
+When a valid burst of edges is detected (more than MIN_EDGES within
+BURST_WINDOW_MS), fires the callback with 'LOCK' or 'UNLOCK'.
 
-Pull-down resistors ensure stable LOW when no button is pressed.
-Debounce of ~150ms prevents false triggers from RF noise or burst edges.
+This approach works because 433MHz OOK receivers output a rapid series of
+HIGH/LOW transitions when a button is pressed (Manchester/OOK data stream).
 """
 
 from __future__ import annotations
@@ -37,9 +36,11 @@ def _get_gpio():
 
 
 class RFReceiver:
-    """Two-button 433MHz remote via GPIO polling thread.
+    """
+    433MHz OOK remote receiver via GPIO edge-detection with pulse-width timing.
 
-    Supports per-pin polarity: 'rising' (LOW→HIGH) or 'falling' (HIGH→LOW).
+    Records timestamps of every edge (BOTH rising and falling) and detects
+    bursts characteristic of 433MHz OOK data transmissions.
 
     Attributes:
         lock_pin:   GPIO reading LOCK button receiver output.
@@ -47,29 +48,34 @@ class RFReceiver:
         is_configured: Always True (no code learning needed).
     """
 
-    POLL_INTERVAL = 0.02   # 50 Hz poll rate
-    DEBOUNCE_S = 0.15      # minimum interval between triggers
+    # Minimum edges in a burst to qualify as a valid RF transmission
+    MIN_EDGES = 10
+    # Time window (seconds) for a valid burst
+    BURST_WINDOW_S = 0.10
+    # Debounce interval (seconds) between successive triggers
+    DEBOUNCE_S = 0.25
 
-    def __init__(self, lock_pin: int = 22, unlock_pin: int = 23,
-                 lock_polarity: str = 'rising', unlock_polarity: str = 'falling'):
+    def __init__(self, lock_pin: int = 22, unlock_pin: int = 23):
         """
         Args:
-            lock_pin: GPIO for LOCK receiver data pin.
+            lock_pin:   GPIO for LOCK receiver data pin.
             unlock_pin: GPIO for UNLOCK receiver data pin.
-            lock_polarity: 'rising' (LOW→HIGH) or 'falling' (HIGH→LOW).
-            unlock_polarity: 'rising' or 'falling'.
         """
         self.lock_pin = lock_pin
         self.unlock_pin = unlock_pin
-        self._lock_polarity = lock_polarity
-        self._unlock_polarity = unlock_polarity
         self._gpio = _get_gpio()
         self._callback: Optional[Callable[[str], None]] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
-        self._last_lock_ts = 0.0
+        self._is_configured = True  # always ready
+
+        # Burst detection state per pin
+        self._lock_edges: list[float] = []      # timestamps of last N edges
+        self._unlock_edges: list[float] = []
+        self._last_lock_ts = 0.0                 # last debounced trigger
         self._last_unlock_ts = 0.0
-        self.is_configured = True  # always ready
+        self._lock_mutex = threading.Lock()
+        self._unlock_mutex = threading.Lock()
 
         if self._gpio is not None:
             try:
@@ -78,7 +84,7 @@ class RFReceiver:
                 self._gpio.setup(self.lock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
                 self._gpio.setup(self.unlock_pin, self._gpio.IN, pull_up_down=self._gpio.PUD_DOWN)
                 logger.info(
-                    "RF receiver: LOCK=GPIO%d, UNLOCK=GPIO%d (pull-down, poll)",
+                    "RF receiver: LOCK=GPIO%d, UNLOCK=GPIO%d (edge-detect)",
                     self.lock_pin, self.unlock_pin,
                 )
             except Exception as exc:
@@ -87,85 +93,103 @@ class RFReceiver:
         else:
             logger.warning("RPi.GPIO unavailable — RF receiver disabled")
 
+    @property
+    def is_configured(self) -> bool:
+        return self._is_configured
+
     def set_callback(self, cb: Callable[[str], None]):
         """Set callback receiving 'LOCK' or 'UNLOCK' on button press."""
         self._callback = cb
 
     def start(self) -> bool:
-        """Start the polling background thread. Returns True on success."""
+        """Start the edge-detection background thread. Returns True on success."""
         if self._gpio is None:
             return False
         try:
             self._running = True
-            self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+            self._thread = threading.Thread(target=self._run_edge_detect, daemon=True)
             self._thread.start()
-            logger.info("RF poll thread started (LOCK=GPIO%d, UNLOCK=GPIO%d)",
+            logger.info("RF edge-detect thread started (LOCK=GPIO%d, UNLOCK=GPIO%d)",
                         self.lock_pin, self.unlock_pin)
             return True
         except Exception as exc:
-            logger.error("Failed to start RF poll thread: %s", exc)
+            logger.error("Failed to start RF receiver: %s", exc)
             self._running = False
             return False
 
     def stop(self):
-        """Stop the polling thread and clean up."""
+        """Stop the edge-detection thread and clean up."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=2)
         if self._gpio is not None:
             try:
-                self._gpio.cleanup(self.lock_pin)
-                self._gpio.cleanup(self.unlock_pin)
+                self._gpio.remove_event_detect(self.lock_pin)
+            except Exception:
+                pass
+            try:
+                self._gpio.remove_event_detect(self.unlock_pin)
             except Exception:
                 pass
         logger.info("RF receiver stopped")
 
-    # ── Internal: polling loop ─────────────────────────────────────
+    # ── Internal: edge detection ──────────────────────────────────────
 
-    def _poll_loop(self):
-        """Background thread: poll both GPIOs at POLL_INTERVAL rate.
+    def _on_lock_edge(self, channel):
+        """Callback on any GPIO edge change on LOCK pin."""
+        now = time.time()
+        with self._lock_mutex:
+            self._lock_edges.append(now)
+            # Keep only edges within the burst window
+            while self._lock_edges and (now - self._lock_edges[0]) > self.BURST_WINDOW_S:
+                self._lock_edges.pop(0)
+            edge_count = len(self._lock_edges)
 
-        Uses transition detection with per-pin polarity:
-          'rising'  → fires on LOW→HIGH
-          'falling' → fires on HIGH→LOW
-        """
-        prev_lock = False
-        prev_unlock = False
+        if edge_count >= self.MIN_EDGES and (now - self._last_lock_ts) > self.DEBOUNCE_S:
+            self._last_lock_ts = now
+            logger.info("RF: LOCK button pressed (%d edges in %.0fms)",
+                        edge_count, self.BURST_WINDOW_S * 1000)
+            with self._lock_mutex:
+                self._lock_edges.clear()
+            if self._callback:
+                self._callback("LOCK")
 
-        # Quick initial read to avoid false trigger on first poll
+    def _on_unlock_edge(self, channel):
+        """Callback on any GPIO edge change on UNLOCK pin."""
+        now = time.time()
+        with self._unlock_mutex:
+            self._unlock_edges.append(now)
+            while self._unlock_edges and (now - self._unlock_edges[0]) > self.BURST_WINDOW_S:
+                self._unlock_edges.pop(0)
+            edge_count = len(self._unlock_edges)
+
+        if edge_count >= self.MIN_EDGES and (now - self._last_unlock_ts) > self.DEBOUNCE_S:
+            self._last_unlock_ts = now
+            logger.info("RF: UNLOCK button pressed (%d edges in %.0fms)",
+                        edge_count, self.BURST_WINDOW_S * 1000)
+            with self._unlock_mutex:
+                self._unlock_edges.clear()
+            if self._callback:
+                self._callback("UNLOCK")
+
+    def _run_edge_detect(self):
+        """Background thread: set up edge detection callbacks and keep alive."""
         try:
-            prev_lock = bool(self._gpio.input(self.lock_pin))
-            prev_unlock = bool(self._gpio.input(self.unlock_pin))
-        except Exception:
-            pass
+            self._gpio.add_event_detect(self.lock_pin, self._gpio.BOTH,
+                                        callback=self._on_lock_edge)
+            self._gpio.add_event_detect(self.unlock_pin, self._gpio.BOTH,
+                                        callback=self._on_unlock_edge)
+        except Exception as exc:
+            logger.error("Failed to add edge detection: %s", exc)
+            self._running = False
+            return
 
+        logger.info("RF edge detection active on GPIO%d, GPIO%d",
+                    self.lock_pin, self.unlock_pin)
+
+        # Keep thread alive; callbacks fire from a separate RPi.GPIO thread
         while self._running:
-            now = time.time()
-            curr_lock = bool(self._gpio.input(self.lock_pin))
-            curr_unlock = bool(self._gpio.input(self.unlock_pin))
-
-            # ── LOCK ─────────────────────────────────────────────
-            if self._lock_polarity == 'falling':
-                lock_active = prev_lock and not curr_lock   # HIGH→LOW
-            else:
-                lock_active = curr_lock and not prev_lock   # LOW→HIGH
-            if lock_active and (now - self._last_lock_ts) > self.DEBOUNCE_S:
-                self._last_lock_ts = now
-                logger.info("RF: LOCK button pressed")
-                if self._callback:
-                    self._callback("LOCK")
-
-            # ── UNLOCK ───────────────────────────────────────────
-            if self._unlock_polarity == 'falling':
-                unlock_active = prev_unlock and not curr_unlock   # HIGH→LOW
-            else:
-                unlock_active = curr_unlock and not prev_unlock   # LOW→HIGH
-            if unlock_active and (now - self._last_unlock_ts) > self.DEBOUNCE_S:
-                self._last_unlock_ts = now
-                logger.info("RF: UNLOCK button pressed")
-                if self._callback:
-                    self._callback("UNLOCK")
-
-            prev_lock = curr_lock
-            prev_unlock = curr_unlock
-            time.sleep(self.POLL_INTERVAL)
+            try:
+                time.sleep(0.5)
+            except Exception:
+                break
