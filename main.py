@@ -28,7 +28,6 @@ try:
     from buzzer_controller import BuzzerController
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
-    from liveness_detector import LivenessDetector
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -126,7 +125,6 @@ class FaceDoorSystem:
         self.buzzer = BuzzerController()
         self.face_storage = FaceStorage()
         self.face_recognizer = FaceRecognizer()
-        self.liveness = LivenessDetector()
         self.logger = ActivityLogger()
 
         self.bt_server = BluetoothServer()
@@ -342,10 +340,8 @@ class FaceDoorSystem:
             self._show_preview(frame, "SCANNING")
 
         if face_locations:
-            print("[Main] Face detected — transitioning to COLLECTING")
-            self._liveness_frames = []
-            # Don't reset liveness — blinks detected during scanning already count
-            self.state = State.COLLECTING
+            print("[Main] Face detected — going to COMPARE")
+            self.state = State.COMPARE
             return
 
         # Non-blocking BT client accept
