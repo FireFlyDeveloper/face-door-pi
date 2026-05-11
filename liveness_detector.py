@@ -24,8 +24,6 @@ import numpy as np
 SCORE_THRESHOLD = 0.5        # min liveness score to pass (0-1)
 SCALE = 2.7                  # crop margin multiplier around bbox
 INPUT_SIZE = 80              # model input (80x80)
-SCORE_SMOOTH_ALPHA = 0.5     # EMA for per-frame scoring
-MIN_FRAMES = 5               # min frames before passed=true
 
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -91,9 +89,8 @@ class LivenessDetector:
         self._detector = dlib.get_frontal_face_detector()
 
     def reset(self):
-        """Reset scoring state."""
-        self._smooth_score = 0.5
-        self._frame_count = 0
+        """Clear scoring state."""
+        pass
 
     def process_frame(self, frame: np.ndarray) -> Dict:
         """
@@ -106,17 +103,15 @@ class LivenessDetector:
             dict with: passed, score, liveness_score, face_detected, details.
         """
         self._ensure_models()
-        self._frame_count += 1
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         faces = self._detector(gray, 0)
 
         if not faces:
-            self._smooth_score = 0.5
             return {
                 'passed': False,
-                'score': 0.5,
-                'liveness_score': 0.5,
+                'score': 0.0,
+                'liveness_score': 0.0,
                 'face_detected': False,
                 'details': 'no face',
             }
@@ -126,8 +121,8 @@ class LivenessDetector:
         if crop is None or crop.size < 100:
             return {
                 'passed': False,
-                'score': 0.5,
-                'liveness_score': 0.5,
+                'score': 0.0,
+                'liveness_score': 0.0,
                 'face_detected': True,
                 'details': 'crop too small',
             }
@@ -148,44 +143,32 @@ class LivenessDetector:
 
         # Liveness score = live class probability
         live_prob = float(probs[0])
-
-        # Smooth score
-        self._smooth_score = (
-            SCORE_SMOOTH_ALPHA * live_prob +
-            (1 - SCORE_SMOOTH_ALPHA) * self._smooth_score
-        )
-
-        passed = (
-            self._frame_count >= MIN_FRAMES and
-            round(self._smooth_score, 3) >= SCORE_THRESHOLD
-        )
+        passed = live_prob >= SCORE_THRESHOLD
 
         print_attack = float(probs[1])
         replay_attack = float(probs[2])
 
         return {
             'passed': passed,
-            'score': self._smooth_score,
+            'score': live_prob,
             'liveness_score': live_prob,
             'face_detected': True,
             'details': (
                 f"live={live_prob:.3f} "
                 f"print={print_attack:.3f} "
-                f"replay={replay_attack:.3f} "
-                f"smoothed={self._smooth_score:.3f}"
+                f"replay={replay_attack:.3f}"
             ),
         }
 
     def check_liveness(self, frames: List[np.ndarray]) -> Dict:
-        """Batch mode — processes all frames, returns average result."""
-        self.reset()
+        """Batch mode — processes all frames, passes if majority have live_prob >= threshold."""
         scores = []
         for frame in frames:
             result = self.process_frame(frame)
-            scores.append(result['score'])
+            scores.append(result['liveness_score'])
 
-        avg_score = np.mean(scores) if scores else 0.0
-        passed = len(scores) >= MIN_FRAMES and round(avg_score, 3) >= SCORE_THRESHOLD
+        avg_score = float(np.mean(scores)) if scores else 0.0
+        passed = avg_score >= SCORE_THRESHOLD
 
         return {
             'passed': passed,
