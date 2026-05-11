@@ -65,10 +65,10 @@ class RelayController:
             try:
                 self._gpio.setmode(self._gpio.BCM)
                 self._gpio.setwarnings(False)
-                self._gpio.setup(self.pin1, self._gpio.OUT, initial=self._gpio.HIGH)
+                self._gpio.setup(self.pin1, self._gpio.OUT, initial=self._gpio.LOW)
                 self._gpio.setup(self.pin2, self._gpio.OUT, initial=self._gpio.HIGH)
                 logger.info(
-                    "H-bridge relays: R1=GPIO%d(HIGH=OFF), R2=GPIO%d(HIGH=OFF) — STOP",
+                    "H-bridge relays: R1=GPIO%d(LOW=ON), R2=GPIO%d(HIGH=OFF) — STOP",
                     self.pin1, self.pin2,
                 )
             except Exception as exc:
