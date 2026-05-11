@@ -1,9 +1,13 @@
 """
 relay_controller.py — 5V relay module for solenoid lock via GPIO.
 
-Provides RelayController class to unlock (energize relay) and lock
-(de-energize relay) a solenoid door strike on a configurable GPIO pin.
-Uses BCM numbering.
+Provides:
+  - unlock(duration)  — pulse unlock for N seconds (face-recognition auto-unlock)
+  - lock() / unlock_persistent()  — set persistent relay state (RF remote / manual)
+  - set_state(locked)  — unified persistent setter
+
+Uses BCM numbering. RPi.GPIO is imported lazily so this module can be
+imported for testing on non-RPi systems.
 """
 
 from __future__ import annotations
@@ -14,18 +18,14 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Lazy import of RPi.GPIO so that this module can be imported on non-RPi
-# systems for documentation / testing stubs.
 _GPIO: Optional[type] = None
 
 
 def _get_gpio():
-    """Import and return RPi.GPIO module, or None if unavailable."""
     global _GPIO
     if _GPIO is None:
         try:
             import RPi.GPIO as GPIO
-
             _GPIO = GPIO
         except (ImportError, RuntimeError) as exc:
             logger.warning("RPi.GPIO not available: %s", exc)
@@ -34,17 +34,21 @@ def _get_gpio():
 
 
 class RelayController:
-    """Controls a 5V relay module (solenoid lock) via a single GPIO pin."""
+    """Controls a 5V relay module for door lock actuation.
+
+    Supports two modes:
+      - **Pulse mode** (face auto-unlock): ``unlock(duration)`` energizes
+        for N seconds then de-energizes.
+      - **Persistent mode** (RF remote / manual): ``set_state(locked)``
+        sets relay to HIGH (unlocked) or LOW (locked) permanently until
+        changed again.
+    """
 
     def __init__(self, pin: int = 17):
-        """
-        Set up the GPIO pin as an output, initialized LOW (locked).
-
-        Args:
-            pin: BCM GPIO pin number (default 17).
-        """
         self.pin = pin
         self._gpio = _get_gpio()
+        self._locked = True  # track persistent state
+
         if self._gpio is not None:
             try:
                 self._gpio.setmode(self._gpio.BCM)
@@ -57,53 +61,83 @@ class RelayController:
         else:
             logger.warning("RPi.GPIO unavailable — relay operations will be no-ops")
 
+    # ── Pulse mode (face auto-unlock) ──────────────────────────────
+
     def unlock(self, duration: float = 3.0) -> bool:
-        """
-        Energize the relay for *duration* seconds (door unlocked), then lock.
-
-        Args:
-            duration: Seconds to hold the relay energized (default 3.0).
-
-        Returns:
-            True if the operation completed successfully, False on error.
-        """
+        """Energize relay for *duration* seconds, then restore persistent state."""
         if self._gpio is None:
-            logger.warning("GPIO not available — unlock is a no-op")
             return False
 
         try:
-            logger.info("Unlocking door (pin %d HIGH for %.1f s)", self.pin, duration)
+            logger.info("Pulse unlock for %.1f s (pin %d HIGH)", duration, self.pin)
             self._gpio.output(self.pin, self._gpio.HIGH)
             time.sleep(duration)
-            self._gpio.output(self.pin, self._gpio.LOW)
-            logger.info("Door locked (pin %d LOW)", self.pin)
+            # Restore persistent state
+            if self._locked:
+                self._gpio.output(self.pin, self._gpio.LOW)
+                logger.info("Restored LOCKED state")
+            else:
+                self._gpio.output(self.pin, self._gpio.HIGH)
+                logger.info("Restored UNLOCKED state")
             return True
         except Exception as exc:
             logger.error("Relay unlock failed on pin %d: %s", self.pin, exc)
-            # Best-effort restore to safe state
             try:
                 self._gpio.output(self.pin, self._gpio.LOW)
             except Exception:
                 pass
             return False
 
-    def lock(self) -> None:
+    # ── Persistent mode (RF remote / manual) ───────────────────────
+
+    def set_state(self, locked: bool) -> None:
+        """Set persistent relay state.
+
+        Args:
+            locked: True = de-energize (locked), False = energize (unlocked).
         """
-        Immediately de-energize the relay (door locked / safe state).
-        """
+        self._locked = locked  # track state regardless of GPIO availability
         if self._gpio is None:
             return
         try:
-            self._gpio.output(self.pin, self._gpio.LOW)
-            logger.info("Door locked (pin %d LOW)", self.pin)
+            if locked:
+                self._gpio.output(self.pin, self._gpio.LOW)
+                logger.info("Persistent state → LOCKED (pin %d LOW)", self.pin)
+            else:
+                self._gpio.output(self.pin, self._gpio.HIGH)
+                logger.info("Persistent state → UNLOCKED (pin %d HIGH)", self.pin)
         except Exception as exc:
-            logger.error("Failed to lock relay on pin %d: %s", self.pin, exc)
+            logger.error("Failed to set relay state: %s", exc)
+
+    def lock_persistent(self) -> None:
+        """Shortcut: set persistent state to LOCKED."""
+        self.set_state(locked=True)
+
+    def unlock_persistent(self) -> None:
+        """Shortcut: set persistent state to UNLOCKED."""
+        self.set_state(locked=False)
+
+    def lock(self) -> None:
+        """Immediately de-energize relay (locked / safe state).
+
+        Equivalent to lock_persistent() but kept for backward compatibility.
+        """
+        self.lock_persistent()
+
+    @property
+    def is_locked(self) -> bool:
+        """True if the persistent state is LOCKED, False if UNLOCKED."""
+        return self._locked
+
+    # ── Cleanup ────────────────────────────────────────────────────
 
     def cleanup(self) -> None:
         """Clean up GPIO resources (call on shutdown)."""
         if self._gpio is None:
             return
         try:
+            # Always revert to locked on shutdown
+            self._gpio.output(self.pin, self._gpio.LOW)
             self._gpio.cleanup(self.pin)
             logger.info("GPIO cleanup for relay pin %d", self.pin)
         except Exception as exc:

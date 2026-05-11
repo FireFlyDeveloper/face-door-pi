@@ -28,6 +28,7 @@ try:
     from buzzer_controller import BuzzerController
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
+    from rf_receiver import RFReceiver
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -87,6 +88,15 @@ class FaceDoorSystem:
         self.liveness = None
         self.bt_server = None
         self.logger = None
+        self.rf_receiver = None
+
+        # Persistent lock state (RF remote / BT manual override)
+        self._lock_state = "locked"  # "locked" | "unlocked"
+
+        # RF learn mode
+        self._rf_learning = None
+        self._rf_learn_step = None
+        self._rf_learn_timeout = 0
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -131,6 +141,17 @@ class FaceDoorSystem:
         if not self.bt_server.start():
             print("[Main] Bluetooth server failed to start, continuing without BT")
 
+        # 433MHz RF receiver for remote lock/unlock
+        self.rf_receiver = RFReceiver(pin=22)
+        self.rf_receiver.set_callback(self._handle_rf_command)
+        if self.rf_receiver.start():
+            if self.rf_receiver.is_configured:
+                print(f"[Main] RF receiver active — remote codes loaded")
+            else:
+                print("[Main] RF receiver active — no codes configured yet")
+        else:
+            print("[Main] RF receiver unavailable — 433MHz disabled")
+
         print("[Main] All controllers initialized")
         return True
 
@@ -149,6 +170,9 @@ class FaceDoorSystem:
             except Exception: pass
         if self.buzzer:
             try: self.buzzer.cleanup()
+            except Exception: pass
+        if self.rf_receiver:
+            try: self.rf_receiver.stop()
             except Exception: pass
         print("[Main] Cleanup complete")
         try:
@@ -201,6 +225,49 @@ class FaceDoorSystem:
         rgb = np.array(pil_image)
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
         return bgr
+
+    # ── RF Remote Command Handler ────────────────────────────────────
+    def _handle_rf_command(self, action: str):
+        """Called by RFReceiver when a known remote code arrives."""
+        if action == "LOCK":
+            print("[RF] Remote LOCK command")
+            self.relay.lock_persistent()
+            self._lock_state = "locked"
+            self.buzzer.success_beep()
+            self.logger.log_event(
+                face_id="rf_remote", result="MANUAL_LOCK",
+                details="via 433MHz remote"
+            )
+        elif action == "UNLOCK":
+            print("[RF] Remote UNLOCK command")
+            self.relay.unlock_persistent()
+            self._lock_state = "unlocked"
+            self.buzzer.success_beep()
+            self.logger.log_event(
+                face_id="rf_remote", result="MANUAL_UNLOCK",
+                details="via 433MHz remote"
+            )
+
+    # ── RF Learn Callback ─────────────────────────────────────────
+    def _rf_learn_callback(self, code: int, pulselen: int):
+        """
+        Called during learn mode when any RF code is received.
+        Automatically walks through: LOCK step → UNLOCK step → done.
+        """
+        action = self._rf_learn_step
+        print(f"[RF] Learn: received code {code} (pulselen={pulselen}) as {action}")
+
+        if action == "lock":
+            self.rf_receiver.save_code(code, pulselen, "lock")
+            self._rf_learn_step = "unlock"
+            self._rf_learn_timeout = time.time() + 30
+            print("[RF] Learn: LOCK saved — now press UNLOCK button")
+        elif action == "unlock":
+            self.rf_receiver.save_code(code, pulselen, "unlock")
+            self.rf_receiver.set_learn_callback(None)
+            self._rf_learning = None
+            self._rf_learn_step = None
+            print("[RF] Learn complete — LOCK and UNLOCK codes saved")
 
     # ── Bluetooth Command Handler ────────────────────────────────────
     def _handle_bt_command(self, command):
@@ -288,6 +355,68 @@ class FaceDoorSystem:
             except Exception as e:
                 return {'status': 'ERROR', 'message': str(e)}
 
+        # ── Manual Lock / Unlock (persistent state) ─────────────────
+        elif action == 'LOCK_MANUAL' or action == 'LOCK':
+            print("[BT] Manual LOCK command")
+            self.relay.lock_persistent()
+            self._lock_state = "locked"
+            self.buzzer.success_beep()
+            self.logger.log_event(
+                face_id="bt_remote", result="MANUAL_LOCK",
+                details="via Bluetooth"
+            )
+            return {'status': 'OK', 'message': 'Door locked'}
+
+        elif action == 'UNLOCK_MANUAL' or action == 'UNLOCK':
+            print("[BT] Manual UNLOCK command")
+            self.relay.unlock_persistent()
+            self._lock_state = "unlocked"
+            self.buzzer.success_beep()
+            self.logger.log_event(
+                face_id="bt_remote", result="MANUAL_UNLOCK",
+                details="via Bluetooth"
+            )
+            return {'status': 'OK', 'message': 'Door unlocked'}
+
+        elif action == 'GET_STATUS':
+            return {
+                'status': 'OK',
+                'door_state': self._lock_state,
+                'rf_configured': self.rf_receiver.is_configured if self.rf_receiver else False,
+                'face_count': self.face_storage.get_face_count() if self.face_storage else 0,
+            }
+
+        # ── RF Learn Mode ──────────────────────────────────────────
+        elif action == 'LEARN_RF':
+            if not self.rf_receiver or not self.rf_receiver._RF_AVAILABLE:
+                return {'status': 'ERROR', 'message': 'RF receiver not available'}
+            self._rf_learning = {}
+            self._rf_learn_step = "lock"
+            self.rf_receiver.set_learn_callback(self._rf_learn_callback)
+            print("[BT] RF learn mode started — press LOCK button on remote")
+            # Schedule timeout to abort learn mode after 30s
+            self._rf_learn_timeout = time.time() + 30
+            return {
+                'status': 'OK',
+                'message': 'Learn mode started. Press LOCK button on your remote.',
+                'step': 'lock'
+            }
+
+        elif action == 'SAVE_RF':
+            code = command.get('code')
+            pulselen = command.get('pulselen')
+            action_to_save = command.get('action', '').lower()
+            if not code or action_to_save not in ('lock', 'unlock'):
+                return {'status': 'ERROR', 'message': 'Missing code or invalid action'}
+            self.rf_receiver.save_code(int(code), int(pulselen), action_to_save)
+            self.rf_receiver.set_learn_callback(None)  # exit learn mode
+            self._rf_learning = None
+            self._rf_learn_step = None
+            return {
+                'status': 'OK',
+                'message': f'RF code {code} saved for {action_to_save}'
+            }
+
         else:
             return {'status': 'ERROR', 'message': f'Unknown action: {action}'}
 
@@ -333,11 +462,13 @@ class FaceDoorSystem:
             face_locations = self._last_face_locations or []
 
         # Show preview
+        lock_icon = "🔒" if self._lock_state == "locked" else "🔓"
         if face_locations:
-            self._show_preview(frame, "SCANNING — FACE DETECTED",
-                               [f"Faces: {len(face_locations)}"])
+            self._show_preview(frame, f"SCANNING — FACE DETECTED {lock_icon}",
+                               [f"Faces: {len(face_locations)}", f"Door: {self._lock_state.upper()}"])
         else:
-            self._show_preview(frame, "SCANNING")
+            self._show_preview(frame, f"SCANNING {lock_icon}",
+                               [f"Door: {self._lock_state.upper()}"])
 
         if face_locations:
             print("[Main] Face detected — going to COMPARE")
@@ -568,6 +699,16 @@ class FaceDoorSystem:
 
             # Process BT messages during all states
             self._process_bt_client()
+
+            # RF learn mode timeout check
+            if self._rf_learn_step is not None:
+                if time.time() > self._rf_learn_timeout:
+                    print("[Main] RF learn mode timed out")
+                    if self.rf_receiver:
+                        self.rf_receiver.set_learn_callback(None)
+                    self._rf_learning = None
+                    self._rf_learn_step = None
+                    self._rf_learn_timeout = 0
 
         self.cleanup()
         print("[Main] System stopped")
