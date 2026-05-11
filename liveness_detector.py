@@ -21,7 +21,7 @@ import dlib
 import numpy as np
 
 # ── Constants ──────────────────────────────────────────────────────────
-SCORE_THRESHOLD = 0.5        # min liveness score to pass (0-1)
+SCORE_THRESHOLD = 0.3        # min liveness score to pass (0-1)
 SCALE = 2.7                  # crop margin multiplier around bbox
 INPUT_SIZE = 80              # model input (80x80)
 
