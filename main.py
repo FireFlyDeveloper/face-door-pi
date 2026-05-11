@@ -43,7 +43,7 @@ from logger import ActivityLogger
 FRAME_RATE = 15.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
 MAX_COLLECT_FRAMES = 15        # reserved for potential multi-frame scoring
-UNLOCK_DURATION = 3.0
+UNLOCK_DURATION = 1.0
 MATCH_THRESHOLD = 0.6
 
 
