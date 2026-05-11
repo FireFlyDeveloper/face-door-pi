@@ -40,7 +40,8 @@ class RFReceiver:
     433MHz OOK remote receiver via GPIO edge-detection with pulse-width timing.
 
     Records timestamps of every edge (BOTH rising and falling) and detects
-    bursts characteristic of 433MHz OOK data transmissions.
+    bursts characteristic of 433MHz OOK data transmissions, OR a simple
+    voltage drop (single pulse) from VT-type receiver modules.
 
     Attributes:
         lock_pin:   GPIO reading LOCK button receiver output.
@@ -49,11 +50,12 @@ class RFReceiver:
     """
 
     # Minimum edges in a burst to qualify as a valid RF transmission
-    MIN_EDGES = 10
+    # Set low (2) to catch a single voltage-drop pulse (2 edges = HIGH→LOW→HIGH)
+    MIN_EDGES = 2
     # Time window (seconds) for a valid burst
-    BURST_WINDOW_S = 0.10
+    BURST_WINDOW_S = 0.15
     # Debounce interval (seconds) between successive triggers
-    DEBOUNCE_S = 0.25
+    DEBOUNCE_S = 0.30
 
     def __init__(self, lock_pin: int = 22, unlock_pin: int = 23):
         """
@@ -135,42 +137,70 @@ class RFReceiver:
 
     # ── Internal: edge detection ──────────────────────────────────────
 
+    def _check_and_trigger(self, pin_name: str, edges: list, mutex: threading.Lock,
+                           last_ts: float, gpio_pin: int) -> float:
+        """
+        Check if a valid signal was received and trigger callback.
+
+        Two detection modes:
+        1. Edge burst: ≥MIN_EDGES edges within BURST_WINDOW_S (OOK data stream)
+        2. Falling hold: current pin is LOW for >50ms after first edge (VT pulse)
+
+        Returns updated last_ts.
+        """
+        now = time.time()
+        with mutex:
+            while edges and (now - edges[0]) > self.BURST_WINDOW_S:
+                edges.pop(0)
+            edge_count = len(edges)
+
+        # Mode 1: edge burst detected
+        if edge_count >= self.MIN_EDGES and (now - last_ts) > self.DEBOUNCE_S:
+            logger.info("RF: %s pressed (%d edges in %.0fms)",
+                        pin_name, edge_count, self.BURST_WINDOW_S * 1000)
+            with mutex:
+                edges.clear()
+            if self._callback:
+                self._callback(pin_name)
+            return now
+
+        # Mode 2: falling-edge hold (pin is LOW, has been for a while)
+        if edge_count >= 1 and (now - last_ts) > self.DEBOUNCE_S:
+            try:
+                pin_val = bool(self._gpio.input(gpio_pin))
+            except Exception:
+                pin_val = True  # assume HIGH on error, don't trigger
+            if not pin_val:
+                # Pin is LOW and has been for >=1 edge cycle + debounce check
+                hold_time = now - edges[0]
+                if hold_time > 0.05:  # held LOW for >50ms
+                    logger.info("RF: %s pressed (VT hold %.0fms, %d edges)",
+                                pin_name, hold_time * 1000, edge_count)
+                    with mutex:
+                        edges.clear()
+                    if self._callback:
+                        self._callback(pin_name)
+                    return now
+
+        return last_ts
+
     def _on_lock_edge(self, channel):
         """Callback on any GPIO edge change on LOCK pin."""
-        now = time.time()
         with self._lock_mutex:
-            self._lock_edges.append(now)
-            # Keep only edges within the burst window
-            while self._lock_edges and (now - self._lock_edges[0]) > self.BURST_WINDOW_S:
-                self._lock_edges.pop(0)
-            edge_count = len(self._lock_edges)
-
-        if edge_count >= self.MIN_EDGES and (now - self._last_lock_ts) > self.DEBOUNCE_S:
-            self._last_lock_ts = now
-            logger.info("RF: LOCK button pressed (%d edges in %.0fms)",
-                        edge_count, self.BURST_WINDOW_S * 1000)
-            with self._lock_mutex:
-                self._lock_edges.clear()
-            if self._callback:
-                self._callback("LOCK")
+            self._lock_edges.append(time.time())
+        self._last_lock_ts = self._check_and_trigger(
+            "LOCK", self._lock_edges, self._lock_mutex,
+            self._last_lock_ts, self.lock_pin
+        )
 
     def _on_unlock_edge(self, channel):
         """Callback on any GPIO edge change on UNLOCK pin."""
-        now = time.time()
         with self._unlock_mutex:
-            self._unlock_edges.append(now)
-            while self._unlock_edges and (now - self._unlock_edges[0]) > self.BURST_WINDOW_S:
-                self._unlock_edges.pop(0)
-            edge_count = len(self._unlock_edges)
-
-        if edge_count >= self.MIN_EDGES and (now - self._last_unlock_ts) > self.DEBOUNCE_S:
-            self._last_unlock_ts = now
-            logger.info("RF: UNLOCK button pressed (%d edges in %.0fms)",
-                        edge_count, self.BURST_WINDOW_S * 1000)
-            with self._unlock_mutex:
-                self._unlock_edges.clear()
-            if self._callback:
-                self._callback("UNLOCK")
+            self._unlock_edges.append(time.time())
+        self._last_unlock_ts = self._check_and_trigger(
+            "UNLOCK", self._unlock_edges, self._unlock_mutex,
+            self._last_unlock_ts, self.unlock_pin
+        )
 
     def _run_edge_detect(self):
         """Background thread: set up edge detection callbacks and keep alive."""
