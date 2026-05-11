@@ -111,24 +111,42 @@ class RFReceiver:
     # ── Internal: polling loop ─────────────────────────────────────
 
     def _poll_loop(self):
-        """Background thread: poll both GPIOs at POLL_INTERVAL rate."""
+        """Background thread: poll both GPIOs at POLL_INTERVAL rate.
+
+        Uses transition detection (LOW→HIGH) instead of level detection,
+        so a stuck-HIGH receiver module won't trigger repeatedly.
+        """
+        prev_lock = False
+        prev_unlock = False
+
+        # Quick initial read to match prev state and avoid false trigger on first poll
+        try:
+            prev_lock = bool(self._gpio.input(self.lock_pin))
+            prev_unlock = bool(self._gpio.input(self.unlock_pin))
+        except Exception:
+            pass
+
         while self._running:
             now = time.time()
+            curr_lock = bool(self._gpio.input(self.lock_pin))
+            curr_unlock = bool(self._gpio.input(self.unlock_pin))
 
-            # Check LOCK pin
-            if self._gpio.input(self.lock_pin):
+            # ── LOCK: LOW→HIGH transition ─────────────────────────
+            if curr_lock and not prev_lock:
                 if (now - self._last_lock_ts) > self.DEBOUNCE_S:
                     self._last_lock_ts = now
                     logger.info("RF: LOCK button pressed")
                     if self._callback:
                         self._callback("LOCK")
 
-            # Check UNLOCK pin
-            if self._gpio.input(self.unlock_pin):
+            # ── UNLOCK: LOW→HIGH transition ───────────────────────
+            if curr_unlock and not prev_unlock:
                 if (now - self._last_unlock_ts) > self.DEBOUNCE_S:
                     self._last_unlock_ts = now
                     logger.info("RF: UNLOCK button pressed")
                     if self._callback:
                         self._callback("UNLOCK")
 
+            prev_lock = curr_lock
+            prev_unlock = curr_unlock
             time.sleep(self.POLL_INTERVAL)
