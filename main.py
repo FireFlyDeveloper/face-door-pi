@@ -41,7 +41,7 @@ from logger import ActivityLogger
 # ── Constants ───────────────────────────────────────────────────────────
 FRAME_RATE = 15.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
-MAX_COLLECT_FRAMES = 90        # 6s window for 2 blinks at 15fps
+MAX_COLLECT_FRAMES = 15        # ~1s window — MiniFASNet is single-frame
 UNLOCK_DURATION = 3.0
 MATCH_THRESHOLD = 0.6
 
@@ -360,7 +360,7 @@ class FaceDoorSystem:
 
     #    ── State: COLLECTING ────────────────────────────────────────────
     def _state_collecting(self):
-        """Collect frames and detect blinks in real-time. Exits early on 2 blinks."""
+        """Collect frames and run MiniFASNet anti-spoof scoring. Exits early on passed liveness."""
         frame = self.camera.capture_frame()
         if frame is None:
             return
@@ -369,10 +369,8 @@ class FaceDoorSystem:
         self._liveness_frames.append(frame)
         self._frame_count += 1
 
-        # Process frame for blink detection (real-time)
+        # Process frame for MiniFASNet anti-spoof
         lr = self.liveness.process_frame(frame)
-        blinks = lr['blinks_detected']
-        ear = lr['ear']
 
         # Every 5 frames, verify face is still visible
         if len(self._liveness_frames) % 5 == 0:
@@ -388,30 +386,28 @@ class FaceDoorSystem:
         # Show preview with progress
         progress = len(self._liveness_frames)
         self._show_preview(frame, "COLLECTING",
-                           [f"Frame {progress}/{MAX_COLLECT_FRAMES}  Blinks: {blinks}  EAR: {ear:.2f}"])
+                           [f"Frame {progress}/{MAX_COLLECT_FRAMES}  Score: {lr['score']:.3f}"])
 
-        # Early exit: enough blinks detected
+        # Early exit: enough frames with high liveness score
         if lr['passed']:
-            print(f"[Main] Liveness PASSED — {blinks} blinks detected at frame {progress}")
+            print(f"[Main] Liveness PASSED — score={lr['score']:.3f} at frame {progress}")
             self.state = State.COMPARE
             return
 
-        # Timeout: too long without enough blinks
+        # Timeout: too long without passing liveness
         if len(self._liveness_frames) >= MAX_COLLECT_FRAMES:
-            print(f"[Main] Liveness FAILED — only {blinks}/2 blinks in {MAX_COLLECT_FRAMES} frames")
+            print(f"[Main] Liveness FAILED — score={lr['score']:.3f} in {MAX_COLLECT_FRAMES} frames")
             self.state = State.REJECTED
 
     # ── State: LIVENESS_CHECK ────────────────────────────────────────
     def _state_liveness_check(self):
-        """Run 3-layer liveness detection on collected frames."""
+        """Run MiniFASNet batch liveness check on collected frames."""
         print("[Main] Running liveness check...")
         try:
             result = self.liveness.check_liveness(self._liveness_frames)
             score = result['score']
-            blink_s = result.get('blink_score', 0)
-            motion_s = result.get('motion_score', 0)
             details = result.get('details', '')
-            print(f"[Main]   Blink={blink_s:.2f}  Motion={motion_s:.2f}  Combined={score:.2f}")
+            print(f"[Main]   Liveness score={score:.2f}")
             if result['passed']:
                 print(f"[Main] Liveness PASSED (score={score:.3f})")
                 self._show_preview(self._latest_frame, "LIVENESS PASSED ✅",
