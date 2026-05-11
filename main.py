@@ -623,6 +623,12 @@ class FaceDoorSystem:
             self.cleanup()
             return
 
+        # Direct GPIO polling for RF remote (bypasses RFReceiver daemon thread)
+        self._rf_lock_state = False
+        self._rf_unlock_state = False
+        self._rf_last_lock_ts = 0.0
+        self._rf_last_unlock_ts = 0.0
+
         self.state = State.SCANNING
         print(f"[Main] Entering auto-scan loop at ~{FRAME_RATE}fps")
 
@@ -654,6 +660,25 @@ class FaceDoorSystem:
             sleep_time = FRAME_INTERVAL - elapsed
             if sleep_time > 0:
                 time.sleep(sleep_time)
+
+            # Direct GPIO RF remote polling (bypasses daemon thread issues)
+            try:
+                import RPi.GPIO as GPIO
+                curr_lock = bool(GPIO.input(22))
+                curr_unlock = bool(GPIO.input(23))
+                now = time.time()
+                if curr_lock and not self._rf_lock_state and (now - self._rf_last_lock_ts) > 0.15:
+                    self._rf_last_lock_ts = now
+                    print(f"[RF-DIRECT] GPIO22=LOCK pressed (val={int(curr_lock)})")
+                    self._handle_rf_command("LOCK")
+                if curr_unlock and not self._rf_unlock_state and (now - self._rf_last_unlock_ts) > 0.15:
+                    self._rf_last_unlock_ts = now
+                    print(f"[RF-DIRECT] GPIO23=UNLOCK pressed (val={int(curr_unlock)})")
+                    self._handle_rf_command("UNLOCK")
+                self._rf_lock_state = curr_lock
+                self._rf_unlock_state = curr_unlock
+            except Exception as e:
+                pass
 
             # Process BT messages during all states
             self._process_bt_client()
