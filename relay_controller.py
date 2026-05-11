@@ -6,10 +6,9 @@ an H-bridge. Active-low relay modules: LOW=ON(energized), HIGH=OFF.
 
 Truth table (active-low relays):
   R1(GPIO17)  R2(GPIO27)  Motor
-  HIGH        HIGH        Clockwise  (UNLOCK)
-  LOW         LOW         Counter-CW (LOCK)
-  LOW         HIGH        STOP/Brake (idle)
-  HIGH        LOW         STOP/Brake (idle)
+  HIGH        HIGH        STOP/Brake (idle)
+  LOW         HIGH        Clockwise  (UNLOCK)
+  HIGH        LOW         Counter-CW (LOCK)
 
 Always returns to STOP after any pulse to prevent motor burn-out
 (no limit switch sensor on the actuator).
@@ -65,10 +64,10 @@ class RelayController:
             try:
                 self._gpio.setmode(self._gpio.BCM)
                 self._gpio.setwarnings(False)
-                self._gpio.setup(self.pin1, self._gpio.OUT, initial=self._gpio.LOW)
+                self._gpio.setup(self.pin1, self._gpio.OUT, initial=self._gpio.HIGH)
                 self._gpio.setup(self.pin2, self._gpio.OUT, initial=self._gpio.HIGH)
                 logger.info(
-                    "H-bridge relays: R1=GPIO%d(LOW=ON), R2=GPIO%d(HIGH=OFF) — STOP",
+                    "H-bridge relays: R1=GPIO%d(HIGH=OFF), R2=GPIO%d(HIGH=OFF) — STOP",
                     self.pin1, self.pin2,
                 )
             except Exception as exc:
@@ -92,9 +91,9 @@ class RelayController:
     # ── STOP ────────────────────────────────────────────────────────
 
     def stop(self) -> None:
-        """Immediately brake the motor (R1=ON, R2=OFF → both active-low OFF/ON)."""
-        logger.debug("H-bridge: STOP (R1=ON R2=OFF)")
-        self._set(_RELAY_ON, _RELAY_OFF)
+        """Immediately brake the motor (both relays OFF)."""
+        logger.debug("H-bridge: STOP (R1=OFF R2=OFF)")
+        self._set(_RELAY_OFF, _RELAY_OFF)
 
     # ── UNLOCK pulse (Clockwise) ────────────────────────────────────
 
@@ -111,7 +110,7 @@ class RelayController:
             return False
         try:
             logger.info("H-bridge: UNLOCK (CW) for %.1f s", duration)
-            self._set(_RELAY_OFF, _RELAY_OFF)  # both OFF → CW
+            self._set(_RELAY_ON, _RELAY_OFF)  # R1=ON, R2=OFF → CW
             time.sleep(duration)
             self.stop()
             return True
@@ -138,7 +137,7 @@ class RelayController:
             return False
         try:
             logger.info("H-bridge: LOCK (CCW) for %.1f s", duration)
-            self._set(_RELAY_ON, _RELAY_ON)  # both ON → CCW
+            self._set(_RELAY_OFF, _RELAY_ON)  # R1=OFF, R2=ON → CCW
             time.sleep(duration)
             self.stop()
             return True
