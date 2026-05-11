@@ -680,14 +680,20 @@ class FaceDoorSystem:
                 curr_lock = bool(GPIO.input(22))
                 curr_unlock = bool(GPIO.input(23))
                 now = time.time()
+                # Detect ANY change on LOCK pin (rising from LOW→HIGH)
                 if curr_lock and not self._rf_lock_state and (now - self._rf_last_lock_ts) > 0.15:
                     self._rf_last_lock_ts = now
                     print(f"[RF-DIRECT] GPIO22=LOCK pressed (val={int(curr_lock)})")
                     self._handle_rf_command("LOCK")
-                if curr_unlock and not self._rf_unlock_state and (now - self._rf_last_unlock_ts) > 0.15:
+                # Detect ANY change on UNLOCK pin (falling from HIGH→LOW or rising if it dips)
+                if curr_unlock != self._rf_unlock_state and (now - self._rf_last_unlock_ts) > 0.15:
                     self._rf_last_unlock_ts = now
-                    print(f"[RF-DIRECT] GPIO23=UNLOCK pressed (val={int(curr_unlock)})")
-                    self._handle_rf_command("UNLOCK")
+                    print(f"[RF-DIRECT] GPIO23={curr_unlock} UNLOCK change detected")
+                    if not curr_unlock:
+                        print(f"[RF-DIRECT] GPIO23 went LOW — triggering UNLOCK")
+                        self._handle_rf_command("UNLOCK")
+                    else:
+                        print(f"[RF-DIRECT] GPIO23 went HIGH — ignoring (idle state)")
                 self._rf_lock_state = curr_lock
                 self._rf_unlock_state = curr_unlock
             except Exception as e:
