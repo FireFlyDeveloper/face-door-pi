@@ -1,17 +1,10 @@
 """
-face_recognizer.py — Face detection + ArcFace encoding via ONNX Runtime.
+face_recognizer.py — Face detection + encoding using dlib.
 
-Detection: dlib HOG frontal face detector (fast, same API as before).
-Recognition: ArcFace R100 ONNX model producing 512-D L2-normalized embeddings
-  with cosine similarity matching.
+Detection: dlib HOG frontal face detector.
+Recognition: dlib ResNet 128-D embedding (Euclidean distance matching).
 
-Reference:
-  Deng et al. (2019) — ArcFace: Additive Angular Margin Loss for
-  Deep Face Recognition. State-of-the-art, used in Qengineering RPi impl.
-
-Model: ArcFace R100 ONNX
-  Source: https://github.com/deepinsight/insightface
-  Download via scripts/download_models.sh
+Compatible with existing faces.json (128-D encodings).
 """
 
 from __future__ import annotations
@@ -26,67 +19,32 @@ import numpy as np
 
 log = logging.getLogger(__name__)
 
-ONNX_MODEL = "./models/arcface_r100.onnx"
-INPUT_SIZE = (112, 112)  # ArcFace standard input
-
 
 class FaceRecognizer:
     """
-    Face detection via dlib HOG, recognition via ArcFace ONNX.
-
-    Public API (backward-compatible method signatures):
-      detect_faces(image) -> List[dlib.rectangle]
-      get_face_encoding(image) -> (512-D ndarray, dlib.rectangle) | None
-      register_face(images) -> 512-D ndarray | None
+    Face detection via dlib HOG, encoding via dlib ResNet 128-D.
     """
 
     def __init__(self, threshold: float = 0.6):
-        self.threshold = threshold
+        self._threshold = threshold
 
-        # ArcFace ONNX session
-        self._session: Optional[object] = None
-        self._input_name: Optional[str] = None
-        self._load_onnx()
-
-        # dlib HOG detector (same as before)
+        # dlib HOG face detector (fast)
         self._detector = dlib.get_frontal_face_detector()
+
+        # Shape predictors for alignment
         self._shape_predictor_5 = self._load_shape_predictor(
             "shape_predictor_5_face_landmarks.dat"
         )
+        self._shape_predictor_68 = self._load_shape_predictor(
+            "shape_predictor_68_face_landmarks.dat"
+        )
 
-        self._encoding_dim = 512  # ArcFace output
+        # ResNet face recognition model (128-D embedding)
+        self._face_rec_model = self._load_recognition_model()
 
     # ------------------------------------------------------------------
     # Model loading
     # ------------------------------------------------------------------
-
-    def _load_onnx(self):
-        if not os.path.exists(ONNX_MODEL):
-            log.warning(
-                "FaceRecognizer: ONNX model not found at %s — "
-                "encoding will return zero vectors. "
-                "Run scripts/download_models.sh",
-                ONNX_MODEL,
-            )
-            return
-        try:
-            import onnxruntime as ort
-
-            opts = ort.SessionOptions()
-            opts.inter_op_num_threads = 4
-            opts.intra_op_num_threads = 4
-            self._session = ort.InferenceSession(
-                ONNX_MODEL,
-                sess_options=opts,
-                providers=["CPUExecutionProvider"],
-            )
-            self._input_name = self._session.get_inputs()[0].name
-            log.info(
-                "FaceRecognizer: ArcFace ONNX loaded (%s)",
-                ONNX_MODEL,
-            )
-        except ImportError:
-            log.error("onnxruntime not installed. Run: pip install onnxruntime")
 
     @staticmethod
     def _load_shape_predictor(filename: str):
@@ -94,20 +52,32 @@ class FaceRecognizer:
         paths = [
             f"/usr/share/dlib/{filename}",
             os.path.join(
-                os.path.dirname(os.path.dirname(dlib.__file__)),
-                "data",
-                filename,
+                os.path.dirname(os.path.dirname(dlib.__file__)), "data", filename
             ),
-            os.path.join(
-                os.path.dirname(os.path.dirname(dlib.__file__)),
-                filename,
-            ),
+            os.path.join(os.path.dirname(os.path.dirname(dlib.__file__)), filename),
         ]
         for p in paths:
             if os.path.exists(p):
                 return dlib.shape_predictor(p)
-        # Fall through — create a dummy that won't crash
         log.warning("Shape predictor %s not found — landmarks disabled", filename)
+        return None
+
+    @staticmethod
+    def _load_recognition_model():
+        """Find and load dlib face recognition ResNet model."""
+        model_name = "dlib_face_recognition_resnet_model_v1.dat"
+        paths = [
+            f"/usr/share/dlib/{model_name}",
+            os.path.join(
+                os.path.dirname(os.path.dirname(dlib.__file__)), "data", model_name
+            ),
+            os.path.join(os.path.dirname(os.path.dirname(dlib.__file__)), model_name),
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                log.info("FaceRecognizer: dlib ResNet model loaded from %s", p)
+                return dlib.face_recognition_model_v1(p)
+        log.warning("FaceRecognizer: dlib ResNet model not found!")
         return None
 
     # ------------------------------------------------------------------
@@ -127,10 +97,13 @@ class FaceRecognizer:
         self, image: np.ndarray
     ) -> Optional[Tuple[np.ndarray, dlib.rectangle]]:
         """
-        Detect largest face and return (512-D embedding, bounding box).
+        Detect largest face and return (128-D encoding, bounding box).
 
         Returns None if no face detected or model not loaded.
         """
+        if self._face_rec_model is None:
+            return None
+
         faces = self.detect_faces(image)
         if not faces:
             return None
@@ -139,20 +112,26 @@ class FaceRecognizer:
             faces,
             key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()),
         )
-        embedding = self._embed(image, largest)
-        if embedding is None:
-            return None
-        return embedding, largest
+
+        rgb = self._to_rgb(image)
+
+        # Use 5-point predictor for alignment
+        shape = self._shape_predictor_5(rgb, largest)
+        encoding = np.array(
+            self._face_rec_model.compute_face_descriptor(rgb, shape),
+            dtype=np.float64,
+        )
+        return encoding, largest
 
     def register_face(self, images: List[np.ndarray]) -> Optional[np.ndarray]:
         """
-        Average ArcFace embeddings across multiple images.
+        Average dlib ResNet 128-D encodings across multiple images.
 
         Args:
             images: List of BGR numpy arrays.
 
         Returns:
-            Averaged 512-D L2-normalized embedding, or None if no face found.
+            Averaged 128-D L2-normalized encoding, or None if no face found.
         """
         valid: List[np.ndarray] = []
         for img in images:
@@ -169,17 +148,17 @@ class FaceRecognizer:
 
         avg = np.mean(valid, axis=0)
         avg = avg / (np.linalg.norm(avg) + 1e-6)
-        return avg.astype(np.float32)
+        return avg.astype(np.float64)
 
     def get_face_landmarks(
         self, image: np.ndarray
     ) -> Optional[List[Tuple[int, int]]]:
         """
-        Compute 5-point facial landmarks.
+        Compute 68-point facial landmarks.
 
         Returns list of (x, y) tuples, or None if no face found.
         """
-        if self._shape_predictor_5 is None:
+        if self._shape_predictor_68 is None:
             return None
         faces = self.detect_faces(image)
         if not faces:
@@ -189,46 +168,8 @@ class FaceRecognizer:
             key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()),
         )
         rgb = self._to_rgb(image)
-        shape = self._shape_predictor_5(rgb, largest)
-        return [(shape.part(i).x, shape.part(i).y) for i in range(5)]
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _embed(self, image: np.ndarray, face: dlib.rectangle) -> Optional[np.ndarray]:
-        """Extract 512-D ArcFace embedding for a single face rect."""
-        if self._session is None:
-            # Graceful degradation: return zeros
-            return np.zeros(self._encoding_dim, dtype=np.float32)
-
-        # Crop face with margin
-        x1 = max(0, face.left())
-        y1 = max(0, face.top())
-        x2 = min(image.shape[1], face.right())
-        y2 = min(image.shape[0], face.bottom())
-        face_crop = image[y1:y2, x1:x2]
-        if face_crop.size == 0:
-            return None
-
-        # Preprocess
-        img = cv2.resize(face_crop, INPUT_SIZE)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32)
-        # ArcFace normalization: mean=127.5, std=128.0
-        img = (img - 127.5) / 128.0
-        img = np.transpose(img, (2, 0, 1))      # HWC → CHW
-        img = np.expand_dims(img, axis=0)        # (1, 3, 112, 112)
-
-        output = self._session.run(None, {self._input_name: img})
-        embedding = output[0][0]
-
-        # L2 normalize
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        return embedding.astype(np.float32)
+        shape = self._shape_predictor_68(rgb, largest)
+        return [(shape.part(i).x, shape.part(i).y) for i in range(68)]
 
     @staticmethod
     def _to_rgb(image: np.ndarray) -> np.ndarray:

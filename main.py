@@ -73,7 +73,7 @@ class FaceDoorSystem:
         self._running = True
         self._latest_frame = None
         self._matched_id = None
-        self._last_score = 0.0
+        self._last_distance = 0.0
         self._frame_count = 0
         self._fps_timer = time.time()
         self._fps_counter = 0
@@ -515,39 +515,38 @@ class FaceDoorSystem:
 
             encoding, _ = result
 
-            # ── Stage 4: Matching ────────────────────────────────────
+            # ── Stage 4: Matching (Euclidean distance for dlib 128-D) ──
             t1 = time.perf_counter()
             stored_faces = self.face_storage.list_faces()
             best_match = None
-            best_score = -1.0
+            best_dist = float('inf')
 
             if stored_faces:
                 for face_id, face_data in stored_faces.items():
                     for stored_enc in face_data.get('encoding', []):
-                        # Cosine similarity (both L2-normed)
-                        sim = float(np.dot(encoding, stored_enc))
-                        if sim > best_score:
-                            best_score = sim
+                        dist = float(np.linalg.norm(encoding - stored_enc))
+                        if dist < best_dist:
+                            best_dist = dist
                             best_match = face_id
 
             t_match_ms = (time.perf_counter() - t1) * 1000
 
             # ── Decision ─────────────────────────────────────────────
-            granted = best_match is not None and best_score >= MATCH_THRESHOLD
+            granted = best_match is not None and best_dist < MATCH_THRESHOLD
 
             if granted:
-                print(f"[Main]   Match: {best_match} (cos sim={best_score:.4f}) — GRANTED")
+                print(f"[Main]   Match: {best_match} (dist={best_dist:.4f}) — GRANTED")
                 self._matched_id = best_match
-                self._last_score = best_score
+                self._last_distance = best_dist
                 self._show_preview(frame, f"MATCH: {best_match} ✅",
-                                   [f"Score: {best_score:.3f}",
+                                   [f"Distance: {best_dist:.3f}",
                                     f"Threshold: {MATCH_THRESHOLD}"])
                 self.state = State.GRANTED
             else:
-                reason = "no_stored_faces" if not stored_faces else f"score={best_score:.4f}"
+                reason = "no_stored_faces" if not stored_faces else f"dist={best_dist:.4f}"
                 print(f"[Main]   No match ({reason}) — REJECTED")
                 self._show_preview(frame, "NO MATCH ❌",
-                                   [f"Best score: {best_score:.3f}",
+                                   [f"Best distance: {best_dist:.3f}",
                                     f"Threshold: {MATCH_THRESHOLD}"])
                 self.state = State.REJECTED
 
@@ -560,7 +559,7 @@ class FaceDoorSystem:
                 anti_spoof_score=live_score,
                 is_live=True,
                 match_id=best_match if granted else None,
-                match_distance=best_score if not granted else None,
+                match_distance=best_dist if not granted else None,
                 result="GRANTED" if granted else "REJECTED",
             )
 
@@ -583,7 +582,7 @@ class FaceDoorSystem:
         self.logger.log_event(
             face_id=face_id,
             result='GRANTED',
-            details=f'score={self._last_score:.4f}'
+            details=f'distance={self._last_distance:.4f}'
         )
 
         if self._latest_frame is not None:
