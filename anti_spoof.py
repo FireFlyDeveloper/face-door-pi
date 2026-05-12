@@ -128,10 +128,13 @@ class AntiSpoofDetector:
         # MiniFASNet outputs: [spoof, ?, live] or [spoof_spoof, ~, live]
         out = output[0]
         if out.shape[-1] >= 3:
-            # 3-class: index 2 is live
+            # 3-class: index 2 discriminates but in REVERSE
+            # Photo (fake) → index 2 ≈ 0.9, Real face → index 2 ≈ 0.1
+            # So live_score = 1.0 - softmax_index_2
             scores = out[0]
             exp_scores = np.exp(scores - np.max(scores))
-            live_score = float(exp_scores[2] / np.sum(exp_scores))
+            idx2_score = float(exp_scores[2] / np.sum(exp_scores))
+            live_score = 1.0 - idx2_score
         elif out.shape[-1] == 2:
             scores = out[0]
             exp_scores = np.exp(scores - np.max(scores))
