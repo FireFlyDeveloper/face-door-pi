@@ -2,7 +2,7 @@
 face_storage.py — JSON-based face encoding storage for Raspberry Pi face door system.
 
 Stores up to MAX_FACES (5) face encodings as JSON. Each encoding is a list of 10
-128-D numpy arrays stored as nested lists. Provides full CRUD operations and
+512-D numpy arrays stored as nested lists. Provides full CRUD operations and
 activity logging.
 """
 
@@ -55,17 +55,17 @@ class FaceStorage:
 
     @staticmethod
     def encode_encoding(encoding: np.ndarray) -> List[float]:
-        """Convert a 128-D numpy encoding array to a JSON-serializable list."""
-        if encoding.shape != (128,):
-            raise ValueError(f"Encoding must be 128-D, got shape {encoding.shape}")
+        """Convert a numpy encoding array to a JSON-serializable list."""
+        if len(encoding.shape) != 1:
+            raise ValueError(f"Encoding must be 1-D, got shape {encoding.shape}")
         return encoding.tolist()
 
     @staticmethod
     def decode_encoding(data: List[float]) -> np.ndarray:
-        """Convert a JSON-serialized list back into a 128-D numpy array."""
+        """Convert a JSON-serialized list back into a numpy array."""
         arr = np.array(data, dtype=np.float64)
-        if arr.shape != (128,):
-            raise ValueError(f"Decoded encoding must be 128-D, got shape {arr.shape}")
+        if len(arr.shape) != 1:
+            raise ValueError(f"Decoded encoding must be 1-D, got shape {arr.shape}")
         return arr
 
     # ------------------------------------------------------------------

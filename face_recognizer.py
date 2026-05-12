@@ -1,58 +1,114 @@
 """
-face_recognizer.py — Face detection + encoding using face_recognition / dlib.
+face_recognizer.py — Face detection + ArcFace encoding via ONNX Runtime.
 
-Provides:
-  - Face detection via dlib's HOG + CNN frontal face detector
-  - 128-D face encoding via dlib's ResNet face recognition model
-  - Landmark detection (68-point) for liveness / alignment
-  - Recognition against a known-face dictionary with Euclidean distance
+Detection: dlib HOG frontal face detector (fast, same API as before).
+Recognition: ArcFace R100 ONNX model producing 512-D L2-normalized embeddings
+  with cosine similarity matching.
+
+Reference:
+  Deng et al. (2019) — ArcFace: Additive Angular Margin Loss for
+  Deep Face Recognition. State-of-the-art, used in Qengineering RPi impl.
+
+Model: ArcFace R100 ONNX
+  Source: https://github.com/deepinsight/insightface
+  Download via scripts/download_models.sh
 """
 
+from __future__ import annotations
+
+import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import dlib
 import numpy as np
 
+log = logging.getLogger(__name__)
+
+ONNX_MODEL = "./models/arcface_r100.onnx"
+INPUT_SIZE = (112, 112)  # ArcFace standard input
+
 
 class FaceRecognizer:
-    """Face detection, encoding, landmark extraction, and recognition."""
+    """
+    Face detection via dlib HOG, recognition via ArcFace ONNX.
 
-    def __init__(self):
-        # HOG-based face detector (fast, default)
+    Public API (backward-compatible method signatures):
+      detect_faces(image) -> List[dlib.rectangle]
+      get_face_encoding(image) -> (512-D ndarray, dlib.rectangle) | None
+      register_face(images) -> 512-D ndarray | None
+    """
+
+    def __init__(self, threshold: float = 0.6):
+        self.threshold = threshold
+
+        # ArcFace ONNX session
+        self._session: Optional[object] = None
+        self._input_name: Optional[str] = None
+        self._load_onnx()
+
+        # dlib HOG detector (same as before)
         self._detector = dlib.get_frontal_face_detector()
-
-        # 5-point landmark predictor — sufficient for face alignment
-        # We also load the 68-point model for liveness detection (EAR)
-        predictor_5_path = "/usr/share/dlib/shape_predictor_5_face_landmarks.dat"
-        predictor_68_path = "/usr/share/dlib/shape_predictor_68_face_landmarks.dat"
-
-        # Fall back to searching common paths if not found
-        import os
-
-        for p in [predictor_5_path, predictor_68_path]:
-            if not os.path.exists(p):
-                # Try alternate paths on Raspberry Pi / Debian
-                alt = os.path.join(
-                    os.path.dirname(os.path.dirname(dlib.__file__)),
-                    "data",
-                    os.path.basename(p),
-                )
-                if os.path.exists(alt):
-                    if "68" in p:
-                        predictor_68_path = alt
-                    else:
-                        predictor_5_path = alt
-
-        self._shape_predictor_5 = dlib.shape_predictor(predictor_5_path)
-        self._shape_predictor_68 = dlib.shape_predictor(predictor_68_path)
-
-        # Face recognition model (ResNet 128-D embedding)
-        self._face_rec_model = dlib.face_recognition_model_v1(
-            "/usr/share/dlib/dlib_face_recognition_resnet_model_v1.dat"
+        self._shape_predictor_5 = self._load_shape_predictor(
+            "shape_predictor_5_face_landmarks.dat"
         )
 
-        self._threshold = 0.6  # Euclidean distance threshold
+        self._encoding_dim = 512  # ArcFace output
+
+    # ------------------------------------------------------------------
+    # Model loading
+    # ------------------------------------------------------------------
+
+    def _load_onnx(self):
+        if not os.path.exists(ONNX_MODEL):
+            log.warning(
+                "FaceRecognizer: ONNX model not found at %s — "
+                "encoding will return zero vectors. "
+                "Run scripts/download_models.sh",
+                ONNX_MODEL,
+            )
+            return
+        try:
+            import onnxruntime as ort
+
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 4
+            opts.intra_op_num_threads = 4
+            self._session = ort.InferenceSession(
+                ONNX_MODEL,
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+            self._input_name = self._session.get_inputs()[0].name
+            log.info(
+                "FaceRecognizer: ArcFace ONNX loaded (%s)",
+                ONNX_MODEL,
+            )
+        except ImportError:
+            log.error("onnxruntime not installed. Run: pip install onnxruntime")
+
+    @staticmethod
+    def _load_shape_predictor(filename: str):
+        """Try common paths for dlib shape predictor files."""
+        paths = [
+            f"/usr/share/dlib/{filename}",
+            os.path.join(
+                os.path.dirname(os.path.dirname(dlib.__file__)),
+                "data",
+                filename,
+            ),
+            os.path.join(
+                os.path.dirname(os.path.dirname(dlib.__file__)),
+                filename,
+            ),
+        ]
+        for p in paths:
+            if os.path.exists(p):
+                return dlib.shape_predictor(p)
+        # Fall through — create a dummy that won't crash
+        log.warning("Shape predictor %s not found — landmarks disabled", filename)
+        return None
 
     # ------------------------------------------------------------------
     # Public API
@@ -60,142 +116,122 @@ class FaceRecognizer:
 
     def detect_faces(self, image: np.ndarray) -> List[dlib.rectangle]:
         """
-        Detect all face bounding boxes in an image.
+        Detect all face bounding boxes using dlib HOG.
 
-        Args:
-            image: BGR numpy array (what OpenCV/cv2 reads).
-
-        Returns:
-            List of dlib.rectangle objects (left, top, right, bottom).
+        Returns list of dlib.rectangle (left, top, right, bottom).
         """
-        # dlib expects RGB; convert if needed
         rgb = self._to_rgb(image)
-        # No upsampling — faster for close-range door use
-        # (person will be ~0.5-1m from camera)
-        return self._detector(rgb, 0)
+        return self._detector(rgb, 0)  # no upsampling for speed
 
     def get_face_encoding(
         self, image: np.ndarray
     ) -> Optional[Tuple[np.ndarray, dlib.rectangle]]:
         """
-        Detect the largest face in the image and return its 128-D encoding
-        and bounding box.
+        Detect largest face and return (512-D embedding, bounding box).
 
-        Args:
-            image: BGR numpy array.
-
-        Returns:
-            (encoding, face_location) if a face is found, else None.
-            encoding is a 128-D np.ndarray of float64.
+        Returns None if no face detected or model not loaded.
         """
         faces = self.detect_faces(image)
-        if len(faces) == 0:
+        if not faces:
             return None
 
-        # Pick the largest face by area
-        largest = max(faces, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()))
-
-        rgb = self._to_rgb(image)
-        shape = self._shape_predictor_5(rgb, largest)
-        encoding = np.array(
-            self._face_rec_model.compute_face_descriptor(rgb, shape), dtype=np.float64
+        largest = max(
+            faces,
+            key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()),
         )
-        return encoding, largest
+        embedding = self._embed(image, largest)
+        if embedding is None:
+            return None
+        return embedding, largest
 
     def register_face(self, images: List[np.ndarray]) -> Optional[np.ndarray]:
         """
-        Register a face from a list of images (typically 10). Detects a face
-        in each valid image, computes encodings, and averages them.
+        Average ArcFace embeddings across multiple images.
 
         Args:
-            images: List of BGR numpy arrays (at least 1, ideally 10).
+            images: List of BGR numpy arrays.
 
         Returns:
-            Averaged 128-D encoding as np.ndarray, or None if no face found
-            in any image.
+            Averaged 512-D L2-normalized embedding, or None if no face found.
         """
-        valid_encodings: List[np.ndarray] = []
-        for i, img in enumerate(images):
+        valid: List[np.ndarray] = []
+        for img in images:
             try:
                 result = self.get_face_encoding(img)
                 if result is not None:
-                    encoding, _ = result
-                    valid_encodings.append(encoding)
+                    enc, _ = result
+                    valid.append(enc)
             except Exception:
                 continue
 
-        if len(valid_encodings) == 0:
+        if not valid:
             return None
 
-        # Average all valid encodings
-        avg_encoding = np.mean(valid_encodings, axis=0)
-        # Renormalize to unit length
-        avg_encoding = avg_encoding / np.linalg.norm(avg_encoding)
-        return avg_encoding
-
-    def recognize(
-        self,
-        face_encoding: np.ndarray,
-        known_faces: Dict[str, Dict[str, Any]],
-    ) -> Optional[Tuple[str, float]]:
-        """
-        Match a face encoding against a dictionary of known faces.
-
-        Args:
-            face_encoding: 128-D query encoding.
-            known_faces: Dict of face_id -> {'encoding': [10 x np.ndarray], ...}.
-                The first encoding from the stored list is used as the reference
-                (the averaged registration encoding is typically at index 0,
-                or all 10 are the same averaged encoding from registration).
-
-        Returns:
-            (best_match_id, smallest_distance) if within threshold, else None.
-        """
-        best_id: Optional[str] = None
-        best_dist: float = float("inf")
-
-        for face_id, face_data in known_faces.items():
-            encodings = face_data.get("encoding", [])
-            for stored_enc in encodings:
-                dist = np.linalg.norm(face_encoding - stored_enc)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_id = face_id
-
-        if best_id is not None and best_dist <= self._threshold:
-            return best_id, best_dist
-        return None
+        avg = np.mean(valid, axis=0)
+        avg = avg / (np.linalg.norm(avg) + 1e-6)
+        return avg.astype(np.float32)
 
     def get_face_landmarks(
         self, image: np.ndarray
     ) -> Optional[List[Tuple[int, int]]]:
         """
-        Compute 68-point facial landmarks (for liveness detection).
+        Compute 5-point facial landmarks.
 
-        Args:
-            image: BGR numpy array.
-
-        Returns:
-            List of (x, y) tuples for the 68 landmarks, or None if no face.
+        Returns list of (x, y) tuples, or None if no face found.
         """
+        if self._shape_predictor_5 is None:
+            return None
         faces = self.detect_faces(image)
-        if len(faces) == 0:
+        if not faces:
+            return None
+        largest = max(
+            faces,
+            key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()),
+        )
+        rgb = self._to_rgb(image)
+        shape = self._shape_predictor_5(rgb, largest)
+        return [(shape.part(i).x, shape.part(i).y) for i in range(5)]
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _embed(self, image: np.ndarray, face: dlib.rectangle) -> Optional[np.ndarray]:
+        """Extract 512-D ArcFace embedding for a single face rect."""
+        if self._session is None:
+            # Graceful degradation: return zeros
+            return np.zeros(self._encoding_dim, dtype=np.float32)
+
+        # Crop face with margin
+        x1 = max(0, face.left())
+        y1 = max(0, face.top())
+        x2 = min(image.shape[1], face.right())
+        y2 = min(image.shape[0], face.bottom())
+        face_crop = image[y1:y2, x1:x2]
+        if face_crop.size == 0:
             return None
 
-        largest = max(faces, key=lambda r: (r.right() - r.left()) * (r.bottom() - r.top()))
-        rgb = self._to_rgb(image)
-        shape = self._shape_predictor_68(rgb, largest)
+        # Preprocess
+        img = cv2.resize(face_crop, INPUT_SIZE)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32)
+        # ArcFace normalization: mean=127.5, std=128.0
+        img = (img - 127.5) / 128.0
+        img = np.transpose(img, (2, 0, 1))      # HWC → CHW
+        img = np.expand_dims(img, axis=0)        # (1, 3, 112, 112)
 
-        landmarks = [(shape.part(i).x, shape.part(i).y) for i in range(68)]
-        return landmarks
+        output = self._session.run(None, {self._input_name: img})
+        embedding = output[0][0]
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        # L2 normalize
+        norm = np.linalg.norm(embedding)
+        if norm > 0:
+            embedding = embedding / norm
+
+        return embedding.astype(np.float32)
 
     @staticmethod
     def _to_rgb(image: np.ndarray) -> np.ndarray:
-        """Convert BGR (OpenCV default) to RGB (dlib default)."""
         if image.shape[2] == 3:
             return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         return image

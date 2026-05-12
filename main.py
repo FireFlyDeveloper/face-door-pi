@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Main entry point for the face recognition door system.
-State-machine-driven auto-scan loop with Bluetooth command handling.
+Revised pipeline: SCANNING -> COMPARE (> anti-spoof + ArcFace) -> GRANTED/REJECTED
+Single-frame pipeline, no multi-frame collection needed.
 """
 
 import sys
@@ -29,7 +30,7 @@ try:
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
     from rf_receiver import RFReceiver
-    from ir_liveness import IRLivenessDetector, ENCODING_VARIANCE_MIN
+    from anti_spoof import AntiSpoofDetector, LIVE_THRESHOLD
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -37,22 +38,20 @@ except ImportError as e:
 
 from bluetooth_server import BluetoothServer
 from logger import ActivityLogger
+from metrics import MetricsLogger
 
 
 # ── Constants ───────────────────────────────────────────────────────────
 FRAME_RATE = 15.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
-COLLECT_DURATION = 2.5        # seconds to collect frames for motion liveness
-UNLOCK_DURATION = 1.0
-MATCH_THRESHOLD = 0.6
+UNLOCK_DURATION = 0.5
+MATCH_THRESHOLD = 0.6        # cosine similarity threshold
 
 
 # ── State Machine ──────────────────────────────────────────────────────
 class State:
     INIT = "INIT"
     SCANNING = "SCANNING"
-    COLLECTING = "COLLECTING"
-    LIVENESS_CHECK = "LIVENESS_CHECK"
     COMPARE = "COMPARE"
     GRANTED = "GRANTED"
     REJECTED = "REJECTED"
@@ -67,33 +66,31 @@ PREVIEW = "--preview" in sys.argv or "-p" in sys.argv
 
 
 class FaceDoorSystem:
-    """Main door system orchestrator with state machine loop."""
+    """Main door system orchestrator with simplified state machine."""
 
     def __init__(self):
         self.state = State.INIT
         self._running = True
-        self._liveness_frames = []
         self._latest_frame = None
         self._matched_id = None
-        self._last_distance = float('inf')
-        self._show_preview_enabled = False
+        self._last_score = 0.0
         self._frame_count = 0
         self._fps_timer = time.time()
-        self._fps_counter = 0  # will be set after GUI check
+        self._fps_counter = 0
 
         self.camera = None
         self.relay = None
         self.buzzer = None
         self.face_storage = None
         self.face_recognizer = None
-        self.ir_liveness = None
+        self.anti_spoof = None
         self.bt_server = None
         self.logger = None
         self.rf_receiver = None
+        self.metrics = None
 
         # Persistent lock state (software tracking for UI)
         self._lock_state = "locked"  # "locked" | "unlocked"
-        self._ir_face_rect = None
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -108,7 +105,7 @@ class FaceDoorSystem:
         """Create and start all controllers. Called once in INIT state."""
         print("[Main] Initializing controllers...")
 
-        # Preview window — only if a display is available (HDMI monitor or ssh -X)
+        # Preview window — only if a display is available
         if PREVIEW or (not HEADLESS and os.environ.get("DISPLAY", "")):
             try:
                 test_img = np.zeros((10, 10, 3), dtype=np.uint8)
@@ -131,11 +128,14 @@ class FaceDoorSystem:
         self.relay = RelayController(pin1=17, pin2=27)
         self.buzzer = BuzzerController()
         self.face_storage = FaceStorage()
-        self.face_recognizer = FaceRecognizer()
+        self.face_recognizer = FaceRecognizer(threshold=MATCH_THRESHOLD)
         self.logger = ActivityLogger()
 
-        # NoIR spectral liveness detection (single-frame, no external LED needed)
-        self.ir_liveness = IRLivenessDetector()
+        # Single-frame MobileNetV2 anti-spoof (with LBP fallback)
+        self.anti_spoof = AntiSpoofDetector()
+
+        # Thesis metrics logger
+        self.metrics = MetricsLogger()
 
         self.bt_server = BluetoothServer()
         if not self.bt_server.start():
@@ -156,6 +156,8 @@ class FaceDoorSystem:
     def cleanup(self):
         """Gracefully shut down all controllers."""
         print("[Main] Cleaning up...")
+        if self.metrics is not None:
+            self.metrics.print_summary()
         if self.bt_server:
             try: self.bt_server.stop()
             except Exception: pass
@@ -209,9 +211,6 @@ class FaceDoorSystem:
         if key == ord('q'):
             print("[Main] 'q' pressed — shutting down")
             self._running = False
-        elif key == ord('d'):
-            # Toggle debug overlay with distance/match info
-            self._show_debug = not getattr(self, '_show_debug', False)
 
     # ── Helper: decode base64 image to np.ndarray (BGR) ────────────
     @staticmethod
@@ -225,10 +224,7 @@ class FaceDoorSystem:
 
     # ── RF Remote Command Handler (motor pulses) ────────────────────
     def _handle_rf_command(self, action: str):
-        """Called by RFReceiver on LOCK or UNLOCK button press.
-
-        Runs motor CCW (lock) or CW (unlock) then auto-stops.
-        """
+        """Called by RFReceiver on LOCK or UNLOCK button press."""
         if action == "LOCK":
             print("[RF] Remote LOCK — motor CCW 1s")
             self.relay.lock_ccw(duration=1.0)
@@ -263,20 +259,18 @@ class FaceDoorSystem:
             if not face_id or not images_b64:
                 return {'status': 'ERROR', 'message': 'Missing face_id or images'}
 
-            # Check capacity early
             if self.face_storage.get_face_count() >= FaceStorage.MAX_FACES:
                 return {'status': 'ERROR', 'message': f'Maximum {FaceStorage.MAX_FACES} faces reached'}
 
             try:
-                # Decode base64 images to numpy arrays
                 images = [self._b64_to_bgr(b64) for b64 in images_b64]
 
-                # Register face: get averaged encoding from all valid images
+                # Register face: get averaged ArcFace 512-D encoding
                 avg_encoding = self.face_recognizer.register_face(images)
                 if avg_encoding is None:
                     return {'status': 'ERROR', 'message': 'No face detected in any image'}
 
-                # Collect all 10 individual encodings for storage
+                # Collect all individual encodings for storage
                 all_encodings = []
                 for img in images:
                     result = self.face_recognizer.get_face_encoding(img)
@@ -286,11 +280,10 @@ class FaceDoorSystem:
                     else:
                         all_encodings.append(avg_encoding)  # fallback
 
-                # Pad to exactly 10 if some images had no face
+                # Pad to exactly 10
                 while len(all_encodings) < 10:
                     all_encodings.append(avg_encoding)
 
-                # Store all 10 encodings
                 self.face_storage.add_face(face_id, all_encodings[:10])
                 print(f"[BT] Registered face: {face_id}")
                 return {'status': 'OK', 'message': f'Face {face_id} registered'}
@@ -314,7 +307,6 @@ class FaceDoorSystem:
         elif action == 'LIST':
             try:
                 faces = self.face_storage.list_faces()
-                # Return metadata only (not raw encodings) for listing
                 face_list = []
                 for fid, fdata in faces.items():
                     face_list.append({
@@ -334,7 +326,6 @@ class FaceDoorSystem:
             except Exception as e:
                 return {'status': 'ERROR', 'message': str(e)}
 
-        # ── Motor Lock / Unlock (pulse, then auto-stop) ─────────────
         elif action == 'LOCK':
             print("[BT] Motor LOCK — CCW 1s")
             self.relay.lock_ccw(duration=1.0)
@@ -365,6 +356,11 @@ class FaceDoorSystem:
                 'face_count': self.face_storage.get_face_count() if self.face_storage else 0,
             }
 
+        elif action == 'GET_METRICS':
+            if self.metrics:
+                return {'status': 'OK', 'metrics': self.metrics.summary()}
+            return {'status': 'ERROR', 'message': 'Metrics not available'}
+
         else:
             return {'status': 'ERROR', 'message': f'Unknown action: {action}'}
 
@@ -382,9 +378,21 @@ class FaceDoorSystem:
         except Exception as e:
             print(f"[Main] BT processing error: {e}")
 
+    # ── Helper: crop face from frame ─────────────────────────────────
+    def _crop_face(self, frame: np.ndarray, rect) -> np.ndarray:
+        """Crop face region from frame using a dlib rectangle."""
+        x1 = max(0, rect.left())
+        y1 = max(0, rect.top())
+        x2 = min(frame.shape[1], rect.right())
+        y2 = min(frame.shape[0], rect.bottom())
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return frame  # fallback: whole frame
+        return crop
+
     # ── State: SCANNING ──────────────────────────────────────────────
     def _state_scanning(self):
-        """Capture frames, detect faces (every 3rd frame), listen for BT."""
+        """Capture frames, detect faces, listen for BT."""
         frame = self.camera.capture_frame()
         if frame is None:
             time.sleep(FRAME_INTERVAL)
@@ -410,7 +418,7 @@ class FaceDoorSystem:
             face_locations = self._last_face_locations or []
 
         # Show preview
-        lock_icon = "🔒" if self._lock_state == "locked" else "🔓"
+        lock_icon = "\U0001f512" if self._lock_state == "locked" else "\U0001f513"
         if face_locations:
             self._show_preview(frame, f"SCANNING — FACE DETECTED {lock_icon}",
                                [f"Faces: {len(face_locations)}", f"Door: {self._lock_state.upper()}"])
@@ -419,21 +427,18 @@ class FaceDoorSystem:
                                [f"Door: {self._lock_state.upper()}"])
 
         if face_locations:
-            # Log detection quality: face count, size, position
+            # Log detection quality
             _largest = max(face_locations,
                            key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
             _fw = _largest.right() - _largest.left()
             _fh = _largest.bottom() - _largest.top()
             print(f"[Main] Face detected ({len(face_locations)} found, "
                   f"largest: {_fw}x{_fh}px at ({_largest.left()},{_largest.top()}))")
-            print("[Main] Transitioning: COLLECTING → NOIR liveness")
-            # Store the largest face rect for spectral crop
-            self._ir_face_rect = _largest
-            # Reset for motion capture
-            self.state = State.COLLECTING
+            print("[Main] Transitioning: SCANNING → COMPARE (anti-spoof + ArcFace)")
+            self.state = State.COMPARE
             return
 
-        # Non-blocking BT client accept
+        # Non-blocking BT
         if self.bt_server and not self.bt_server.is_client_connected():
             try:
                 if self.bt_server.wait_for_connection(timeout=0):
@@ -443,128 +448,121 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    # ── State: COLLECTING (3 frames for encoding consistency) ──
-    def _state_collecting(self):
-        """Capture 3 consecutive frames for encoding consistency check.
-
-        A live face has natural micro-movements causing slight encoding
-        variance. A static phone screen produces near-identical encodings.
-        """
-        frames = []
-        for _ in range(3):
-            frame = self.camera.capture_frame()
-            if frame is not None:
-                frames.append(frame)
-
-        if len(frames) < 2:
-            print("[Main] COLLECTING: insufficient frames")
-            self.state = State.SCANNING
-            return
-
-        self._liveness_frames = frames
-        self._latest_frame = frames[0]
-        print(f"[Main] Captured {len(frames)} frames for encoding consistency")
-        self.state = State.LIVENESS_CHECK
-
-    # ── State: LIVENESS_CHECK (encoding consistency) ──
-    def _state_liveness_check(self):
-        """Check encoding consistency across collected frames.
-
-        A live person's face encoding varies slightly frame-to-frame
-        due to natural micro-movements. A static screen/photo produces
-        near-identical encodings — detected and rejected here.
-        """
-        if not hasattr(self, '_liveness_frames') or not self._liveness_frames:
-            print("[Main] No frames for encoding consistency check")
-            self.state = State.REJECTED
-            return
-
-        print("[Main] Analyzing encoding consistency...")
-        try:
-            result = self.ir_liveness.check_liveness(
-                self._liveness_frames, self._ir_face_rect, self.face_recognizer
-            )
-            passed = result['passed']
-            score = result.get('score', 0.0)
-            mean_dist = result.get('mean_encoding_dist', 0.0)
-            enc_std = result.get('encoding_std', 0.0)
-
-            if passed:
-                print(f"[Main] ENCODING LIVENESS PASSED ✅ "
-                      f"(dist={mean_dist:.4f}, score={score:.3f})")
-                # Use the frame with best encoding for COMPARE
-                self._latest_frame = self._liveness_frames[0]
-                self.state = State.COMPARE
-            else:
-                print(f"[Main] ENCODING LIVENESS FAILED ❌ "
-                      f"(dist={mean_dist:.4f} < {ENCODING_VARIANCE_MIN})")
-                time.sleep(1.5)
-                self.state = State.REJECTED
-        except Exception as e:
-            print(f"[Main] Encoding liveness error: {e}")
-            traceback.print_exc()
-            self.state = State.REJECTED
-
-    # ── State: COMPARE ───────────────────────────────────────────────
+    # ── State: COMPARE (anti-spoof + ArcFace recognition) ───────────
     def _state_compare(self):
-        """Compare the latest frame encoding against stored faces."""
-        print("[Main] Comparing face...")
+        """Single-frame pipeline: anti-spoof → ArcFace encoding → match."""
+        print("[Main] COMPARE: single-frame anti-spoof + ArcFace recognition")
+        t_start = time.perf_counter()
+
         if self._latest_frame is None:
             print("[Main] No frame to compare, returning to SCANNING")
             self.state = State.SCANNING
             return
 
-        try:
-            # Log face detection quality in the compare frame
-            _compare_faces = self.face_recognizer.detect_faces(self._latest_frame)
-            if _compare_faces:
-                _cfa = max(_compare_faces,
-                           key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
-                _cfw = _cfa.right() - _cfa.left()
-                _cfh = _cfa.bottom() - _cfa.top()
-                print(f"[Main]   Face in compare frame: {len(_compare_faces)} found, "
-                      f"largest: {_cfw}x{_cfh}px at ({_cfa.left()},{_cfa.top()})")
-            else:
-                print("[Main]   WARNING: No face detected in compare frame!")
+        frame = self._latest_frame
 
-            result = self.face_recognizer.get_face_encoding(self._latest_frame)
+        try:
+            # ── Stage 1: Face Detection ──────────────────────────────
+            t1 = time.perf_counter()
+            faces = self.face_recognizer.detect_faces(frame)
+            t_detect_ms = (time.perf_counter() - t1) * 1000
+
+            if not faces:
+                print("[Main] No face in compare frame")
+                self.state = State.SCANNING
+                return
+
+            largest_face = max(
+                faces,
+                key=lambda r: (r.right()-r.left()) * (r.bottom()-r.top()),
+            )
+            face_crop = self._crop_face(frame, largest_face)
+            print(f"[Main]   Face crop: {face_crop.shape[1]}x{face_crop.shape[0]}px")
+
+            # ── Stage 2: Anti-Spoof ──────────────────────────────────
+            t1 = time.perf_counter()
+            live_score = self.anti_spoof.predict(face_crop)
+            t_anti_spoof_ms = (time.perf_counter() - t1) * 1000
+
+            is_live = live_score >= LIVE_THRESHOLD
+            print(f"[Main]   Anti-spoof: score={live_score:.3f} "
+                  f"(threshold={LIVE_THRESHOLD}) {'LIVE ✅' if is_live else 'SPOOF ❌'}")
+
+            if not is_live:
+                print("[Main]   REJECTED — spoof detected")
+                self.metrics.log_frame(
+                    detect_ms=t_detect_ms,
+                    anti_spoof_ms=t_anti_spoof_ms,
+                    encode_ms=0,
+                    match_ms=0,
+                    anti_spoof_score=live_score,
+                    is_live=False,
+                    result="REJECTED",
+                )
+                self._last_score = live_score
+                self.state = State.REJECTED
+                return
+
+            # ── Stage 3: ArcFace Encoding ────────────────────────────
+            t1 = time.perf_counter()
+            result = self.face_recognizer.get_face_encoding(frame)
+            t_encode_ms = (time.perf_counter() - t1) * 1000
+
             if result is None:
-                print("[Main] Could not extract encoding, rejecting")
+                print("[Main]   Could not extract ArcFace encoding")
                 self.state = State.REJECTED
                 return
 
             encoding, _ = result
+
+            # ── Stage 4: Matching ────────────────────────────────────
+            t1 = time.perf_counter()
             stored_faces = self.face_storage.list_faces()
-
-            if not stored_faces:
-                print("[Main] No stored faces to compare against, rejecting")
-                self.state = State.REJECTED
-                return
-
-            # Match against all stored encodings (each face stores 10)
             best_match = None
-            self._last_distance = float('inf')
-            for face_id, face_data in stored_faces.items():
-                for stored_enc in face_data.get('encoding', []):
-                    distance = np.linalg.norm(encoding - stored_enc)
-                    if distance < self._last_distance:
-                        self._last_distance = distance
-                        best_match = face_id
+            best_score = -1.0
 
-            if best_match is not None and self._last_distance < MATCH_THRESHOLD:
-                print(f"[Main] Match: {best_match} (dist={self._last_distance:.4f}) — GRANTED")
+            if stored_faces:
+                for face_id, face_data in stored_faces.items():
+                    for stored_enc in face_data.get('encoding', []):
+                        # Cosine similarity (both L2-normed)
+                        sim = float(np.dot(encoding, stored_enc))
+                        if sim > best_score:
+                            best_score = sim
+                            best_match = face_id
+
+            t_match_ms = (time.perf_counter() - t1) * 1000
+
+            # ── Decision ─────────────────────────────────────────────
+            granted = best_match is not None and best_score >= MATCH_THRESHOLD
+
+            if granted:
+                print(f"[Main]   Match: {best_match} (cos sim={best_score:.4f}) — GRANTED")
                 self._matched_id = best_match
-                self._show_preview(self._latest_frame, f"MATCH: {best_match} ✅",
-                                   [f"Distance: {self._last_distance:.3f}",
+                self._last_score = best_score
+                self._show_preview(frame, f"MATCH: {best_match} ✅",
+                                   [f"Score: {best_score:.3f}",
                                     f"Threshold: {MATCH_THRESHOLD}"])
                 self.state = State.GRANTED
             else:
-                reason = "no_match" if best_match is None else f"dist={self._last_distance:.4f}"
-                print(f"[Main] No match ({reason}) — REJECTED")
-                self._show_preview(self._latest_frame, "NO MATCH ❌",
-                                   [f"Best dist: {self._last_distance:.3f}",
+                reason = "no_stored_faces" if not stored_faces else f"score={best_score:.4f}"
+                print(f"[Main]   No match ({reason}) — REJECTED")
+                self._show_preview(frame, "NO MATCH ❌",
+                                   [f"Best score: {best_score:.3f}",
                                     f"Threshold: {MATCH_THRESHOLD}"])
-                time.sleep(1.5)
+                self.state = State.REJECTED
+
+            # ── Log metrics ──────────────────────────────────────────
+            self.metrics.log_frame(
+                detect_ms=t_detect_ms,
+                anti_spoof_ms=t_anti_spoof_ms,
+                encode_ms=t_encode_ms,
+                match_ms=t_match_ms,
+                anti_spoof_score=live_score,
+                is_live=True,
+                match_id=best_match if granted else None,
+                match_distance=best_score if not granted else None,
+                result="GRANTED" if granted else "REJECTED",
+            )
 
         except Exception as e:
             print(f"[Main] Compare error: {e}")
@@ -585,10 +583,9 @@ class FaceDoorSystem:
         self.logger.log_event(
             face_id=face_id,
             result='GRANTED',
-            details=f'distance={self._last_distance:.4f}'
+            details=f'score={self._last_score:.4f}'
         )
 
-        # Keep showing the match on screen during unlock
         if self._latest_frame is not None:
             for _ in range(int(UNLOCK_DURATION * 5)):
                 if not self._running:
@@ -596,8 +593,6 @@ class FaceDoorSystem:
                 self._show_preview(self._latest_frame, f"DOOR UNLOCKED — {face_id} ✅")
                 time.sleep(0.2)
 
-        self._liveness_frames = []
-        self._ir_face_rect = None
         self.state = State.SCANNING
 
     # ── State: REJECTED ──────────────────────────────────────────────
@@ -612,22 +607,19 @@ class FaceDoorSystem:
         self.logger.log_event(
             face_id='unknown',
             result='REJECTED',
-            details='liveness_failed_or_no_match'
+            details=f'anti_spoof_spoof_or_no_match'
         )
 
-        # Show rejection on screen briefly
         if self._latest_frame is not None:
             self._show_preview(self._latest_frame, "ACCESS DENIED ❌")
             time.sleep(1)
 
-        self._liveness_frames = []
-        self._ir_face_rect = None
         self.state = State.SCANNING
 
     # ── Main Loop ────────────────────────────────────────────────────
     def run(self):
         """Main state machine loop."""
-        print("[Main] Face Door System starting...")
+        print("[Main] Face Door System starting (ArcFace + MobileNetV2 anti-spoof)...")
 
         if not self._init_controllers():
             self.cleanup()
@@ -642,10 +634,6 @@ class FaceDoorSystem:
             try:
                 if self.state == State.SCANNING:
                     self._state_scanning()
-                elif self.state == State.COLLECTING:
-                    self._state_collecting()
-                elif self.state == State.LIVENESS_CHECK:
-                    self._state_liveness_check()
                 elif self.state == State.COMPARE:
                     self._state_compare()
                 elif self.state == State.GRANTED:
@@ -656,7 +644,6 @@ class FaceDoorSystem:
                 print(f"[Main] Unhandled error in state {self.state}: {e}")
                 traceback.print_exc()
                 self.state = State.SCANNING
-                self._liveness_frames = []
                 continue
 
             # Maintain framerate

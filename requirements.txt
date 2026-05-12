@@ -1,9 +1,17 @@
 # Face Door System — pip dependencies
 # System packages (install via apt):
-#   sudo apt install python3-picamera2 python3-rpi.gpio python3-bluez
+#   sudo apt install python3-picamera2 python3-rpi.gpio python3-bluez python3-opencv
 #
 # These are installed via pip:
 opencv-python-headless
-face_recognition
 numpy
 scipy
+dlib
+
+# Face recognition — ArcFace ONNX
+onnxruntime
+
+# Anti-spoof — MobileNetV2 TFLite
+# On RPi: pip install tflite-runtime
+# On desktop: pip install tensorflow-cpu or tensorflow
+tflite-runtime
