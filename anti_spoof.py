@@ -25,6 +25,7 @@ import logging
 from typing import Optional
 
 log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
 
 ONNX_MODEL = "./models/minifasnet_v2.onnx"
 ONNX_INPUT_SIZE = (80, 80)
