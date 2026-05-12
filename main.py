@@ -135,7 +135,7 @@ class FaceDoorSystem:
         self.anti_spoof = AntiSpoofDetector()
 
         # Thesis metrics logger
-        self.metrics = MetricsLogger()
+        self.metrics = MetricsLogger(log_dir=PROJECT_DIR)
 
         self.bt_server = BluetoothServer()
         if not self.bt_server.start():

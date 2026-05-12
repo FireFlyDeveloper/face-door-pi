@@ -23,18 +23,17 @@ from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-METRICS_PATH = "./metrics_log.csv"
-DETAIL_PATH = "./metrics_detail.csv"
+METRICS_PATH = "metrics_log.csv"
+DETAIL_PATH = "metrics_detail.csv"
 
 
 class MetricsLogger:
     """Aggregates per-frame metrics and writes CSV summaries."""
 
     def __init__(self, log_dir: str = "."):
-        self.log_dir = log_dir
-        self.metrics_path = os.path.join(log_dir, METRICS_PATH.lstrip("."))
-        self.detail_path = os.path.join(log_dir, DETAIL_PATH.lstrip("."))
-
+        self.log_dir = os.path.abspath(log_dir)
+        self.metrics_path = os.path.join(self.log_dir, METRICS_PATH)
+        self.detail_path = os.path.join(self.log_dir, DETAIL_PATH)
         os.makedirs(log_dir, exist_ok=True)
 
         # Per-frame detail buffer
