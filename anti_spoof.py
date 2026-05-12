@@ -38,7 +38,7 @@ LBP_THRESHOLD = 5.92     # midpoint between photo(5.64) and live(6.20)
 LBP_MARGIN = 0.60        # maps (entropy - threshold) / margin to [0,1]
 
 # ── Final threshold ─────────────────────────────
-SCORE_THRESHOLD = 0.30   # safe margin below calibrated live score (~0.53)
+SCORE_THRESHOLD = 0.90
 
 
 class AntiSpoofDetector:
