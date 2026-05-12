@@ -1,17 +1,20 @@
 """
 anti_spoof.py — Single-frame liveness detection for face anti-spoofing.
 
-Three backends (tried in order):
-  1. MiniFASNet ONNX  — primary (via onnxruntime, already on Pi)
-  2. MobileNetV2 TFLite — secondary
-  3. LBP texture       — classical fallback
+Two backends used together:
+  1. LBP texture analysis     — primary (works on any camera, NoIR-compatible)
+  2. MiniFASNet ONNX          — secondary (deep learning signal)
+
+Combined score = average of both signals for robustness.
+
+NoIR v2 camera behaviour (empirically determined):
+  PHOTO: higher LBP entropy (paper texture visible in IR) → SPOOF
+  LIVE:  lower LBP entropy (skin looks smoother in IR)    → LIVE
+  This is the REVERSE of standard RGB cameras.
 
 Reference:
-  ScienceDirect (2024): MobileNetV2 transfer learning achieves 96% accuracy
-  on live subjects, <0.6s total pipeline on Raspberry Pi 4B.
-
-Models:
-  MiniFASNet: https://github.com/minivision-ai/Silent-Face-Anti-Spoofing
+  Boulkenafet et al. (2016) — Color LBP anti-spoofing.
+  Minivision (2019) — Silent-Face-Anti-Spoofing (MiniFASNet).
 """
 
 from __future__ import annotations
@@ -25,177 +28,83 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 ONNX_MODEL = "./models/minifasnet_v2.onnx"
-TFLITE_MODEL = "./models/anti_spoof_mobilenetv2.tflite"
-ONNX_INPUT_SIZE = (80, 80)     # MiniFASNet input
-TFLITE_INPUT_SIZE = (224, 224)  # MobileNetV2 input
+ONNX_INPUT_SIZE = (80, 80)
 
-# Threshold: score >= LIVE_THRESHOLD → LIVE
-LIVE_THRESHOLD = 0.5
+# LBP entropy thresholds (calibrated for NoIR v2 at 640x480)
+# Lower entropy = LIVE, Higher entropy = SPOOF
+LBP_THRESHOLD = 6.37    # midpoint between photo(6.51) and live(6.23)
+LBP_MARGIN = 0.30       # map (threshold - entropy) / margin to [0, 1]
+
+# Final threshold: combined score >= SCORE_THRESHOLD → LIVE
+SCORE_THRESHOLD = 0.5
 
 
 class AntiSpoofDetector:
     """
     Returns liveness probability [0.0 - 1.0].
-    Score >= LIVE_THRESHOLD → LIVE
-    Score <  LIVE_THRESHOLD → SPOOF
+    Score >= SCORE_THRESHOLD → LIVE
+    Score <  SCORE_THRESHOLD → SPOOF
     """
 
     def __init__(self):
-        self._backend = "lbp"  # fallback default
-        self._session: Optional[object] = None
-        self._input_name: Optional[str] = None
-        self._input_size = None
-        self._tflite_interpreter: Optional[object] = None
-        self._tflite_input_idx: Optional[int] = None
-        self._tflite_output_idx: Optional[int] = None
-        self._load_model()
+        self._onnx_session: Optional[object] = None
+        self._onnx_input_name: Optional[str] = None
+        self._has_onnx = False
+        self._load_onnx()
 
-    def _load_model(self):
-        """Try ONNX first, then TFLite, fall back to LBP."""
-        # Try ONNX (MiniFASNet)
-        if os.path.exists(ONNX_MODEL):
-            try:
-                import onnxruntime as ort
-                opts = ort.SessionOptions()
-                opts.inter_op_num_threads = 4
-                opts.intra_op_num_threads = 4
-                self._session = ort.InferenceSession(
-                    ONNX_MODEL,
-                    sess_options=opts,
-                    providers=["CPUExecutionProvider"],
-                )
-                self._input_name = self._session.get_inputs()[0].name
-                self._input_size = ONNX_INPUT_SIZE
-                self._backend = "onnx"
-                log.info(
-                    "AntiSpoofDetector: ONNX MiniFASNet loaded (%s)",
-                    ONNX_MODEL,
-                )
-                return
-            except Exception as e:
-                log.warning("AntiSpoofDetector: ONNX load failed: %s", e)
-
-        # Try TFLite (MobileNetV2)
-        if os.path.exists(TFLITE_MODEL):
-            try:
-                import tflite_runtime.interpreter as tflite
-                self._tflite_interpreter = tflite.Interpreter(
-                    model_path=TFLITE_MODEL
-                )
-            except ImportError:
-                try:
-                    import tensorflow as tf
-                    self._tflite_interpreter = tf.lite.Interpreter(
-                        model_path=TFLITE_MODEL
-                    )
-                except ImportError:
-                    pass
-
-            if self._tflite_interpreter is not None:
-                self._tflite_interpreter.allocate_tensors()
-                inp = self._tflite_interpreter.get_input_details()
-                self._tflite_input_idx = inp[0]["index"]
-                self._tflite_output_idx = \
-                    self._tflite_interpreter.get_output_details()[0]["index"]
-                self._backend = "tflite"
-                log.info(
-                    "AntiSpoofDetector: TFLite MobileNetV2 loaded (%s)",
-                    TFLITE_MODEL,
-                )
-                return
-
-        # LBP fallback
-        log.warning(
-            "AntiSpoofDetector: No model found — using LBP fallback. "
-            "Run scripts/download_models.sh or place model in models/"
-        )
+    def _load_onnx(self):
+        """Load MiniFASNet ONNX model if available (secondary signal)."""
+        if not os.path.exists(ONNX_MODEL):
+            log.info("AntiSpoofDetector: No ONNX model at %s — using LBP only", ONNX_MODEL)
+            return
+        try:
+            import onnxruntime as ort
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 4
+            opts.intra_op_num_threads = 4
+            self._onnx_session = ort.InferenceSession(
+                ONNX_MODEL,
+                sess_options=opts,
+                providers=["CPUExecutionProvider"],
+            )
+            self._onnx_input_name = self._onnx_session.get_inputs()[0].name
+            self._has_onnx = True
+            log.info(
+                "AntiSpoofDetector: MiniFASNet ONNX loaded (%s) as secondary signal",
+                ONNX_MODEL,
+            )
+        except Exception as e:
+            log.warning("AntiSpoofDetector: ONNX load failed: %s", e)
 
     def predict(self, face_img: np.ndarray) -> float:
         """
-        Returns liveness score: 1.0 = definitely live, 0.0 = definitely spoof.
+        Returns liveness score [0.0, 1.0].
+        Uses LBP (always available) + MiniFASNet ONNX (if loaded).
         """
-        if self._backend == "onnx":
-            return self._predict_onnx(face_img)
-        elif self._backend == "tflite":
-            return self._predict_tflite(face_img)
-        return self._predict_lbp(face_img)
+        lbp_score = self._predict_lbp(face_img)
 
-    def _predict_onnx(self, face_img: np.ndarray) -> float:
-        """MiniFASNet ONNX inference."""
-        inputs = self._preprocess_onnx(face_img)
-        output = self._session.run(None, {self._input_name: inputs})
+        if self._has_onnx:
+            onnx_score = self._predict_onnx(face_img)
+            combined = (lbp_score + onnx_score) / 2.0
+            log.debug(
+                "AntiSpoof: LBP=%.3f ONNX=%.3f combined=%.3f",
+                lbp_score, onnx_score, combined,
+            )
+            return float(np.clip(combined, 0.0, 1.0))
 
-        # MiniFASNet outputs: [spoof, ?, live] or [spoof_spoof, ~, live]
-        out = output[0]
-        if out.shape[-1] >= 3:
-            # 3-class: index 2 discriminates but in REVERSE
-            # Photo (fake) → index 2 ≈ 0.9, Real face → index 2 ≈ 0.1
-            # So live_score = 1.0 - softmax_index_2
-            scores = out[0]
-            exp_scores = np.exp(scores - np.max(scores))
-            idx2_score = float(exp_scores[2] / np.sum(exp_scores))
-            live_score = 1.0 - idx2_score
-        elif out.shape[-1] == 2:
-            scores = out[0]
-            exp_scores = np.exp(scores - np.max(scores))
-            live_score = float(exp_scores[1] / np.sum(exp_scores))
-        else:
-            live_score = float(1.0 / (1.0 + np.exp(-out[0][0])))  # sigmoid
+        log.debug("AntiSpoof LBP: score=%.3f", lbp_score)
+        return float(np.clip(lbp_score, 0.0, 1.0))
 
-        score = np.clip(live_score, 0.0, 1.0)
-        log.debug("AntiSpoof ONNX: score=%.3f", score)
-        return score
-
-    def _preprocess_onnx(self, face_img: np.ndarray) -> np.ndarray:
-        """Preprocess face crop for MiniFASNet ONNX.
-
-        NOTE: MiniFASNet was trained with [0, 255] float inputs (no /255.0).
-        The original ``to_tensor()`` in Silent-Face-Anti-Spoofing returns raw
-        uint8 values cast to float32 without dividing by 255.
-        """
-        w, h = ONNX_INPUT_SIZE
-        img = cv2.resize(face_img, (w, h))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32)
-        # NO /255.0 — MiniFASNet expects [0, 255] range
-        # MiniFASNet uses (1, 3, H, W) format (NCHW)
-        img = np.transpose(img, (2, 0, 1))
-        img = np.expand_dims(img, axis=0)
-        return img
-
-    def _predict_tflite(self, face_img: np.ndarray) -> float:
-        """MobileNetV2 TFLite inference."""
-        img = cv2.resize(face_img, TFLITE_INPUT_SIZE)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32) / 255.0
-        # ImageNet norm
-        MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-        img = (img - MEAN) / STD
-        img = np.expand_dims(img, axis=0)
-
-        self._tflite_interpreter.set_tensor(
-            self._tflite_input_idx, img
-        )
-        self._tflite_interpreter.invoke()
-        output = self._tflite_interpreter.get_tensor(
-            self._tflite_output_idx
-        )
-
-        if output.shape[-1] == 2:
-            live_score = float(output[0][1])
-        else:
-            live_score = float(output[0][0])
-
-        score = np.clip(live_score, 0.0, 1.0)
-        log.debug("AntiSpoof TFLite: score=%.3f", score)
-        return score
+    # ──────────────────────────────────────────────
+    # LBP texture analysis (primary)
+    # ──────────────────────────────────────────────
 
     def _predict_lbp(self, face_img: np.ndarray) -> float:
         """
-        Classical LBP texture fallback.
+        LBP texture analysis.
 
-        Reference: Boulkenafet et al. (2016) — Color LBP anti-spoofing.
+        On NoIR v2: photos have HIGHER entropy than live faces.
+        So score = clamp((LBP_THRESHOLD - entropy) / LBP_MARGIN, 0, 1).
         """
         gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
         gray = cv2.resize(gray, (64, 64))
@@ -206,13 +115,15 @@ class AntiSpoofDetector:
         hist /= hist.sum() + 1e-6
 
         entropy = -float(np.sum(hist * np.log2(hist + 1e-10)))
-        LIVE_ENTROPY_THRESHOLD = 6.2
-        score = np.clip((entropy - LIVE_ENTROPY_THRESHOLD) / 2.0, 0.0, 1.0)
-        log.debug("AntiSpoof LBP: entropy=%.2f score=%.3f", entropy, score)
+        score = np.clip(
+            (LBP_THRESHOLD - entropy) / LBP_MARGIN, 0.0, 1.0
+        )
+        log.debug("AntiSpoof LBP: entropy=%.4f score=%.3f", entropy, score)
         return float(score)
 
     @staticmethod
     def _compute_lbp(gray: np.ndarray) -> np.ndarray:
+        """Basic 8-neighbour LBP."""
         lbp = np.zeros_like(gray, dtype=np.uint8)
         neighbors = [(-1, -1), (-1, 0), (-1, 1), (0, 1),
                      (1, 1), (1, 0), (1, -1), (0, -1)]
@@ -223,3 +134,46 @@ class AntiSpoofDetector:
                             nx:nx + gray.shape[1] - 2]
             lbp[1:-1, 1:-1] |= ((neighbor >= center).astype(np.uint8) << i)
         return lbp
+
+    # ──────────────────────────────────────────────
+    # MiniFASNet ONNX (secondary, deep learning)
+    # ──────────────────────────────────────────────
+
+    def _predict_onnx(self, face_img: np.ndarray) -> float:
+        """MiniFASNet ONNX inference.
+
+        On NoIR: index 2 is HIGH for spoof and LOW for live.
+        So live_score = 1.0 - softmax_index_2.
+        """
+        inputs = self._preprocess_onnx(face_img)
+        output = self._onnx_session.run(
+            None, {self._onnx_input_name: inputs}
+        )
+
+        out = output[0]
+        if out.shape[-1] >= 3:
+            scores = out[0]
+            exp_scores = np.exp(scores - np.max(scores))
+            idx2 = float(exp_scores[2] / np.sum(exp_scores))
+            live_score = 1.0 - idx2
+        elif out.shape[-1] == 2:
+            scores = out[0]
+            exp_scores = np.exp(scores - np.max(scores))
+            live_score = float(exp_scores[1] / np.sum(exp_scores))
+        else:
+            live_score = float(1.0 / (1.0 + np.exp(-out[0][0])))
+
+        score = np.clip(live_score, 0.0, 1.0)
+        log.debug("AntiSpoof ONNX: score=%.3f", score)
+        return score
+
+    def _preprocess_onnx(self, face_img: np.ndarray) -> np.ndarray:
+        """Preprocess face crop for MiniFASNet ONNX ([0,255] float, NCHW)."""
+        w, h = ONNX_INPUT_SIZE
+        img = cv2.resize(face_img, (w, h))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = img.astype(np.float32)
+        # NO /255.0 — MiniFASNet expects [0, 255] range
+        img = np.transpose(img, (2, 0, 1))
+        img = np.expand_dims(img, axis=0)
+        return img

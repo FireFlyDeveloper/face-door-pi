@@ -30,7 +30,7 @@ try:
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
     from rf_receiver import RFReceiver
-    from anti_spoof import AntiSpoofDetector, LIVE_THRESHOLD
+    from anti_spoof import AntiSpoofDetector, SCORE_THRESHOLD as LIVE_THRESHOLD
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
