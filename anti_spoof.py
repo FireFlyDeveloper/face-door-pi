@@ -35,11 +35,12 @@ ONNX_WEIGHT = 0.7
 LBP_WEIGHT = 0.3
 
 # LBP thresholds (calibrated for NoIR v2)
-LBP_THRESHOLD = 6.35     # midpoint estimate
-LBP_MARGIN = 0.35
+# NoIR: lower entropy = LIVE (skin smoother in IR), higher entropy = SPOOF (paper texture)
+LBP_THRESHOLD = 6.30     # live≈6.23, photo≈6.51 → (6.30-6.23)/margin = LBP score
+LBP_MARGIN = 0.30        # 1.0 margin unit over/under the threshold
 
-# Final threshold
-SCORE_THRESHOLD = 0.5
+# Final threshold — lowered from 0.5 because NoIR produces smaller signal differences
+SCORE_THRESHOLD = 0.30
 
 
 class AntiSpoofDetector:
