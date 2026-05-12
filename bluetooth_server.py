@@ -6,7 +6,6 @@ Protocol: each message is a complete JSON object terminated by newline.
 
 import json
 import socket
-import select
 
 try:
     import bluetooth
@@ -70,15 +69,15 @@ class BluetoothServer:
         if bluetooth is None or not self._running or self.server_sock is None:
             return False
         try:
-            # Non-blocking accept with timeout via select
+            # Non-blocking accept via socket timeout (select.select unreliable on PyBluez)
             if timeout is not None:
-                ready = select.select([self.server_sock], [], [], timeout)
-                if not ready[0]:
-                    return False
+                self.server_sock.settimeout(timeout if timeout > 0 else 0.0)
 
             self.client_sock, self.client_address = self.server_sock.accept()
             print(f"[BluetoothServer] Client connected: {self.client_address}")
             return True
+        except socket.timeout:
+            return False
         except Exception as e:
             print(f"[BluetoothServer] Accept failed: {e}")
             return False
@@ -115,10 +114,8 @@ class BluetoothServer:
                     return None
 
         try:
-            ready = select.select([self.client_sock], [], [], timeout)
-            if not ready[0]:
-                # Timeout — no data available
-                return None
+            # Use socket timeout instead of select.select (unreliable on PyBluez)
+            self.client_sock.settimeout(timeout if timeout > 0 else 0.0)
 
             data = self.client_sock.recv(4096)
             if not data:
@@ -144,9 +141,11 @@ class BluetoothServer:
                 return None
             else:
                 # Still waiting for the rest of the message
-                print(f"[BluetoothServer] Partial message ({(len(chunk))}B), waiting for more...")
+                print(f"[BluetoothServer] Partial message ({len(chunk)}B), waiting for more...")
                 return None
 
+        except socket.timeout:
+            return None
         except json.JSONDecodeError:
             print(f"[BluetoothServer] Invalid JSON received")
             self._recv_buffer = ""
@@ -175,10 +174,10 @@ class BluetoothServer:
                 self.client_sock.close()
             except Exception:
                 pass
-            self.client_sock = None
-            self.client_address = None
-            self._recv_buffer = ""
-            print("[BluetoothServer] Client disconnected")
+        self.client_sock = None
+        self.client_address = None
+        self._recv_buffer = ""
+        print("[BluetoothServer] Client disconnected")
 
     def is_client_connected(self):
         """Check if a client is currently connected."""
