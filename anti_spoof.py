@@ -1,15 +1,14 @@
 """
 anti_spoof.py — Single-frame liveness detection for face anti-spoofing.
 
-Two backends fused by weighted average:
-  1. MiniFASNet ONNX (weight 0.7)  — primary deep learning signal
-  2. LBP texture      (weight 0.3)  — classical texture backup
+Ensemble: MiniFASNet ONNX (weight 0.6) + Gray LBP entropy (weight 0.4).
 
-MiniFASNet on NoIR v2: index-2 softmax is HIGH for spoof (≈0.9), LOW for live (≈0.1).
-  → live_score = 1.0 - softmax_index_2
-
-LBP on NoIR v2: photos have HIGHER entropy than live faces (reverse of standard cameras).
-  → live_score = clamp((threshold - entropy) / margin)
+Calibrated on NoIR v2 camera (640x480), empirical data:
+  Metric            Photo     Live     Gap
+  LBP gray entropy  5.64     6.20     0.56
+  HSV-H entropy     4.97     6.66     1.69  (not used, kept for reference)
+  ONNX index 2      0.84     0.41     0.43
+  ONNX inverted     0.16     0.59     0.43
 
 Reference:
   Boulkenafet et al. (2016) — Color LBP anti-spoofing.
@@ -25,22 +24,21 @@ import logging
 from typing import Optional
 
 log = logging.getLogger(__name__)
-log.setLevel(logging.DEBUG)
 
 ONNX_MODEL = "./models/minifasnet_v2.onnx"
 ONNX_INPUT_SIZE = (80, 80)
 
-# Weights for the ensemble
-ONNX_WEIGHT = 0.7
-LBP_WEIGHT = 0.3
+# ── Ensemble weights ────────────────────────────
+ONNX_WEIGHT = 0.6
+LBP_WEIGHT = 0.4
 
-# LBP thresholds (calibrated for NoIR v2)
-# NoIR: lower entropy = LIVE (skin smoother in IR), higher entropy = SPOOF (paper texture)
-LBP_THRESHOLD = 6.30     # live≈6.23, photo≈6.51 → (6.30-6.23)/margin = LBP score
-LBP_MARGIN = 0.30        # 1.0 margin unit over/under the threshold
+# ── LBP thresholds ──────────────────────────────
+# NoIR: HIGHER entropy = LIVE (matches classical LBP theory)
+LBP_THRESHOLD = 5.92     # midpoint between photo(5.64) and live(6.20)
+LBP_MARGIN = 0.60        # maps (entropy - threshold) / margin to [0,1]
 
-# Final threshold — lowered from 0.5 because NoIR produces smaller signal differences
-SCORE_THRESHOLD = 0.30
+# ── Final threshold ─────────────────────────────
+SCORE_THRESHOLD = 0.30   # safe margin below calibrated live score (~0.53)
 
 
 class AntiSpoofDetector:
@@ -76,20 +74,22 @@ class AntiSpoofDetector:
             log.warning("ONNX load failed: %s", e)
 
     def predict(self, face_img: np.ndarray) -> float:
-        """Fused liveness score: ONNX (%.0f%%) + LBP (%.0f%%)."""
+        """Ensemble: ONNX inverted + LBP entropy."""
         onnx_score = self._predict_onnx(face_img) if self._has_onnx else 0.0
         lbp_score = self._predict_lbp(face_img)
 
         if self._has_onnx:
             combined = ONNX_WEIGHT * onnx_score + LBP_WEIGHT * lbp_score
-            log.info("AntiSpoof: ONNX=%.3f LBP=%.3f combined=%.3f",
-                      onnx_score, lbp_score, combined)
+            log.info(
+                "AntiSpoof: ONNX=%.3f LBP=%.3f combined=%.3f",
+                onnx_score, lbp_score, combined,
+            )
             return float(np.clip(combined, 0.0, 1.0))
 
-        log.debug("AntiSpoof LBP: score=%.3f", lbp_score)
+        log.info("AntiSpoof LBP: score=%.3f", lbp_score)
         return float(np.clip(lbp_score, 0.0, 1.0))
 
-    # ── LBP ──────────────────────────────────────
+    # ── LBP (primary texture) ──────────────────
 
     def _predict_lbp(self, face_img: np.ndarray) -> float:
         gray = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
@@ -100,7 +100,8 @@ class AntiSpoofDetector:
         hist = hist.astype(np.float32) / (hist.sum() + 1e-6)
 
         entropy = -float(np.sum(hist * np.log2(hist + 1e-10)))
-        score = np.clip((LBP_THRESHOLD - entropy) / LBP_MARGIN, 0.0, 1.0)
+        # Higher entropy = LIVE (classical LBP — rich texture)
+        score = np.clip((entropy - LBP_THRESHOLD) / LBP_MARGIN, 0.0, 1.0)
         return float(score)
 
     @staticmethod
@@ -115,7 +116,7 @@ class AntiSpoofDetector:
             lbp[1:-1, 1:-1] |= ((n >= center).astype(np.uint8) << i)
         return lbp
 
-    # ── ONNX ─────────────────────────────────────
+    # ── MiniFASNet ONNX (deep secondary signal) ─
 
     def _predict_onnx(self, face_img: np.ndarray) -> float:
         inputs = self._preprocess_onnx(face_img)
@@ -126,6 +127,7 @@ class AntiSpoofDetector:
         if out.shape[-1] >= 3:
             scores = out[0]
             e = np.exp(scores - np.max(scores))
+            # On NoIR: idx2=0.84(spoof) / 0.41(live) → invert
             idx2 = float(e[2] / np.sum(e))
             live_score = 1.0 - idx2
         elif out.shape[-1] == 2:
@@ -141,6 +143,6 @@ class AntiSpoofDetector:
         w, h = ONNX_INPUT_SIZE
         img = cv2.resize(face_img, (w, h))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        img = img.astype(np.float32)  # [0, 255], NO /255.0
+        img = img.astype(np.float32)  # [0,255] — NO /255.0
         img = np.transpose(img, (2, 0, 1))[None, :]
         return img
