@@ -443,57 +443,30 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    # ── State: COLLECTING (high-res frame for texture liveness) ──
+    # ── State: COLLECTING (single frame for texture liveness) ──
     def _state_collecting(self):
-        """Capture a single high-res frame (1640x1232) for texture liveness.
-
-        Switches camera to full sensor resolution to capture fine skin
-        texture detail that distinguishes live faces from printed/screen
-        replays. Takes ~0.5s for reconfiguration.
-        Goes to LIVENESS_CHECK after capture.
-        """
-        print("[Main] Capturing high-res frame for texture liveness...")
-        frame = self.camera.capture_liveness_frame()
+        """Capture a single 640x480 frame for texture liveness analysis."""
+        frame = self.camera.capture_frame()
         if frame is None:
-            print("[Main] COLLECTING: high-res frame capture failed")
+            print("[Main] COLLECTING: frame capture failed")
             self.state = State.SCANNING
             return
 
         self._latest_frame = frame
-        # Face rect won't match — re-detect in LIVENESS_CHECK on hi-res
-        self._ir_face_rect = None
-        print("[Main] High-res frame captured — detecting face for liveness")
-        self._show_preview(frame, "TEXTURE LIVENESS — ANALYZING",
-                           ["High-res (1640x1232) texture analysis"])
+        # Face rect from SCANNING (640x480) is valid
+        print("[Main] Frame captured — running texture liveness")
         self.state = State.LIVENESS_CHECK
 
-    # ── State: LIVENESS_CHECK (high-res texture/edge analysis) ──
+    # ── State: LIVENESS_CHECK (texture/edge analysis on 640x480) ──
     def _state_liveness_check(self):
-        """Detect face in high-res frame and run texture liveness analysis.
-
-        At 1640x1232, the IMX219 captures enough texture detail to
-        distinguish real skin (pores, hair) from flat printed/screen media.
-        """
-        if self._latest_frame is None:
-            print("[Main] No frame for texture analysis — rejecting")
+        """Run single-frame texture/edge liveness on captured frame."""
+        if not hasattr(self, '_ir_face_rect') or self._ir_face_rect is None:
+            print("[Main] No face rect for texture analysis — rejecting")
             self.state = State.REJECTED
             return
 
-        h, w = self._latest_frame.shape[:2]
-        print(f"[Main] Analyzing face texture liveness on {w}x{h} frame...")
-
+        print("[Main] Analyzing face texture liveness...")
         try:
-            # Detect face in high-res frame
-            face_locations = self.face_recognizer.detect_faces(self._latest_frame)
-            if not face_locations:
-                print("[Main] No face detected in high-res frame — rejecting")
-                self.state = State.REJECTED
-                return
-
-            largest = max(face_locations,
-                          key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
-            self._ir_face_rect = largest
-
             result = self.ir_liveness.check_liveness(
                 self._latest_frame, self._ir_face_rect
             )
@@ -506,8 +479,6 @@ class FaceDoorSystem:
             if passed:
                 print(f"[Main] TEXTURE LIVENESS PASSED ✅ "
                       f"(score={score:.3f})")
-                # Resize to 640x480 for fast COMPARE
-                self._latest_frame = cv2.resize(self._latest_frame, (640, 480))
                 self.state = State.COMPARE
             else:
                 print(f"[Main] TEXTURE LIVENESS FAILED ❌ "
