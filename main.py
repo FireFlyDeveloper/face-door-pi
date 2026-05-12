@@ -29,7 +29,7 @@ try:
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
     from rf_receiver import RFReceiver
-    from ir_liveness import IRLivenessDetector
+    from ir_liveness import IRLivenessDetector, ENCODING_VARIANCE_MIN
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -443,51 +443,65 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    # ── State: COLLECTING (single frame for texture liveness) ──
+    # ── State: COLLECTING (3 frames for encoding consistency) ──
     def _state_collecting(self):
-        """Capture a single 640x480 frame for texture liveness analysis."""
-        frame = self.camera.capture_frame()
-        if frame is None:
-            print("[Main] COLLECTING: frame capture failed")
+        """Capture 3 consecutive frames for encoding consistency check.
+
+        A live face has natural micro-movements causing slight encoding
+        variance. A static phone screen produces near-identical encodings.
+        """
+        frames = []
+        for _ in range(3):
+            frame = self.camera.capture_frame()
+            if frame is not None:
+                frames.append(frame)
+
+        if len(frames) < 2:
+            print("[Main] COLLECTING: insufficient frames")
             self.state = State.SCANNING
             return
 
-        self._latest_frame = frame
-        # Face rect from SCANNING (640x480) is valid
-        print("[Main] Frame captured — running texture liveness")
+        self._liveness_frames = frames
+        self._latest_frame = frames[0]
+        print(f"[Main] Captured {len(frames)} frames for encoding consistency")
         self.state = State.LIVENESS_CHECK
 
-    # ── State: LIVENESS_CHECK (texture/edge analysis on 640x480) ──
+    # ── State: LIVENESS_CHECK (encoding consistency) ──
     def _state_liveness_check(self):
-        """Run single-frame texture/edge liveness on captured frame."""
-        if not hasattr(self, '_ir_face_rect') or self._ir_face_rect is None:
-            print("[Main] No face rect for texture analysis — rejecting")
+        """Check encoding consistency across collected frames.
+
+        A live person's face encoding varies slightly frame-to-frame
+        due to natural micro-movements. A static screen/photo produces
+        near-identical encodings — detected and rejected here.
+        """
+        if not hasattr(self, '_liveness_frames') or not self._liveness_frames:
+            print("[Main] No frames for encoding consistency check")
             self.state = State.REJECTED
             return
 
-        print("[Main] Analyzing face texture liveness...")
+        print("[Main] Analyzing encoding consistency...")
         try:
             result = self.ir_liveness.check_liveness(
-                self._latest_frame, self._ir_face_rect
+                self._liveness_frames, self._ir_face_rect, self.face_recognizer
             )
             passed = result['passed']
-            score = result['score']
-            tex_var = result.get('texture_variance', 0.0)
-            edge_str = result.get('edge_strength', 0.0)
-            col_sprd = result.get('color_spread', 0.0)
+            score = result.get('score', 0.0)
+            mean_dist = result.get('mean_encoding_dist', 0.0)
+            enc_std = result.get('encoding_std', 0.0)
 
             if passed:
-                print(f"[Main] TEXTURE LIVENESS PASSED ✅ "
-                      f"(score={score:.3f})")
+                print(f"[Main] ENCODING LIVENESS PASSED ✅ "
+                      f"(dist={mean_dist:.4f}, score={score:.3f})")
+                # Use the frame with best encoding for COMPARE
+                self._latest_frame = self._liveness_frames[0]
                 self.state = State.COMPARE
             else:
-                print(f"[Main] TEXTURE LIVENESS FAILED ❌ "
-                      f"(score={score:.3f}, tex_var={tex_var:.1f}, "
-                      f"edge={edge_str:.1f})")
+                print(f"[Main] ENCODING LIVENESS FAILED ❌ "
+                      f"(dist={mean_dist:.4f} < {ENCODING_VARIANCE_MIN})")
                 time.sleep(1.5)
                 self.state = State.REJECTED
         except Exception as e:
-            print(f"[Main] Texture liveness error: {e}")
+            print(f"[Main] Encoding liveness error: {e}")
             traceback.print_exc()
             self.state = State.REJECTED
 

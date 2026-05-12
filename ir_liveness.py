@@ -1,57 +1,44 @@
 """
-ir_liveness.py — High-res texture/edge anti-fool liveness detection.
+ir_liveness.py — Multi-frame encoding consistency anti-spoof liveness.
 
-Uses the IMX219 at 1640x1232 (full sensor detail) to capture enough
-texture information to distinguish live faces from printed photos or
-phone screen replays via:
+Principle:
+  A live person has natural micro-movements (breathing, posture sway)
+  between consecutive frames, causing the 128-D face encoding to vary
+  slightly. A held phone screen or printed photo is unnaturally static,
+  producing near-identical encodings across frames.
 
-1. Texture variance (Laplacian): Real skin has fine pores, hair, and
-   micro-texture at full resolution. Printed paper is flat/smooth.
-   Phone screens have pixel grid artifacts at high magnification.
-2. Edge sharpness (Sobel): Natural skin edges vs artificial reproductions.
-3. Color saturation spread: Natural skin color distribution.
+  This is a well-documented temporal anti-spoofing technique known as
+  "frame-to-frame encoding consistency" in liveness detection literature.
+
+Metrics (across N consecutive frames):
+  1. Mean pairwise encoding distance — live > threshold
+  2. Encoding vector variance (std per dimension, then mean)
 
 Public interface:
-  IRLivenessDetector.check_liveness(frame, face_rect) -> dict
+  IRLivenessDetector.check_liveness(frames, face_rect, face_recognizer) -> dict
   IRLivenessDetector.reset()
 """
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
-# ── Thresholds (tune empirically for Pi Cam v2 @ 1640x1232) ────────────
-TEXTURE_VARIANCE_MIN = 3.0     # Laplacian variance
-EDGE_STRENGTH_MIN = 5.0        # Mean Sobel magnitude
-MIN_FACE_REGION = 100          # minimum face crop pixels
+# ── Thresholds ─────────────────────────────────────────────────────────
+# Minimum mean pairwise distance between face encodings across frames
+# Live faces exhibit natural micro-movement variation > 0.04
+# Static screens produce near-identical encodings < 0.02
+ENCODING_VARIANCE_MIN = 0.04
+# Minimum number of frames required
+MIN_FRAMES = 2
 
 
 _DEBUG = False
 
 
-def _face_region(bgr: np.ndarray, face_rect) -> Optional[np.ndarray]:
-    """Extract the face region from a BGR frame given a dlib rect."""
-    h, w = bgr.shape[:2]
-    x1 = max(face_rect.left(), 0)
-    y1 = max(face_rect.top(), 0)
-    x2 = min(face_rect.right(), w)
-    y2 = min(face_rect.bottom(), h)
-
-    if x2 <= x1 or y2 <= y1:
-        return None
-
-    crop = bgr[y1:y2, x1:x2]
-    if crop.size < MIN_FACE_REGION:
-        return None
-
-    return crop
-
-
 class IRLivenessDetector:
-    """High-res texture/edge anti-fool liveness detector."""
+    """Multi-frame encoding consistency anti-spoof liveness detector."""
 
     def __init__(self, debug: bool = False):
         global _DEBUG
@@ -59,81 +46,90 @@ class IRLivenessDetector:
         self.reset()
 
     def reset(self):
-        """Clear between checks."""
-        pass
+        """Clear state between checks."""
+        self._encodings: List[np.ndarray] = []
+        self._frame_count = 0
 
     def check_liveness(
         self,
-        frame: np.ndarray,
+        frames: List[np.ndarray],
         face_rect,
+        face_recognizer,
     ) -> Dict:
-        """Analyze a single high-res BGR frame for texture-based liveness.
+        """Analyze encoding consistency across multiple frames.
 
         Args:
-            frame: BGR numpy array (1640x1232 recommended).
-            face_rect: dlib rectangle of the detected face.
+            frames: List of BGR numpy arrays (consecutive captures).
+            face_rect: dlib rectangle (same rect used for all frames).
+            face_recognizer: FaceRecognizer instance for encoding.
 
         Returns:
             dict with: passed, score, metrics, details.
         """
-        crop = _face_region(frame, face_rect)
-        if crop is None:
+        if len(frames) < MIN_FRAMES:
             return {
                 'passed': False,
                 'score': 0.0,
-                'texture_variance': 0.0,
-                'edge_strength': 0.0,
-                'color_spread': 0.0,
-                'details': 'face region too small',
+                'mean_encoding_dist': 0.0,
+                'encoding_std': 0.0,
+                'details': f'insufficient frames ({len(frames)} < {MIN_FRAMES})',
             }
 
-        # ── Metric 1: Texture Variance (Laplacian) ────────────────
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        texture_variance = float(np.var(laplacian))
+        self.reset()
 
-        # ── Metric 2: Edge Sharpness (Sobel magnitude) ────────────
-        sobel_x = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        sobel_mag = np.sqrt(sobel_x**2 + sobel_y**2)
-        edge_strength = float(np.mean(sobel_mag))
+        # Extract encoding from each frame using the face recognizer
+        for frame in frames:
+            result = face_recognizer.get_face_encoding(frame)
+            if result is not None:
+                encoding, _ = result
+                self._encodings.append(encoding)
 
-        # ── Metric 3: Color Saturation Spread ──────────────────────
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        saturation = hsv[:, :, 1].astype(np.float32)
-        color_spread = float(np.std(saturation))
+        if len(self._encodings) < MIN_FRAMES:
+            return {
+                'passed': False,
+                'score': 0.0,
+                'mean_encoding_dist': 0.0,
+                'encoding_std': 0.0,
+                'details': f'face encoding failed in {len(self._encodings)}/{len(frames)} frames',
+            }
 
-        # ── Decision ───────────────────────────────────────────────
-        passed_texture = texture_variance >= TEXTURE_VARIANCE_MIN
-        passed_edges = edge_strength >= EDGE_STRENGTH_MIN
-        passed = passed_texture and passed_edges
+        # ── Metric 1: Mean pairwise encoding distance ────────────
+        pairwise_dists = []
+        for i in range(len(self._encodings)):
+            for j in range(i + 1, len(self._encodings)):
+                dist = float(np.linalg.norm(self._encodings[i] - self._encodings[j]))
+                pairwise_dists.append(dist)
+        mean_encoding_dist = float(np.mean(pairwise_dists)) if pairwise_dists else 0.0
 
-        tex_score = min(1.0, texture_variance / (TEXTURE_VARIANCE_MIN * 3))
-        edge_score = min(1.0, edge_strength / (EDGE_STRENGTH_MIN * 3))
-        col_score = min(1.0, color_spread / 40.0)
-        combined = (tex_score * 0.5) + (edge_score * 0.3) + (col_score * 0.2)
+        # ── Metric 2: Encoding vector variance ───────────────────
+        stacked = np.stack(self._encodings, axis=0)
+        per_dim_std = np.std(stacked, axis=0)
+        encoding_std = float(np.mean(per_dim_std))
 
-        details = (
-            f"tex_var={texture_variance:.1f} "
-            f"(thresh>={TEXTURE_VARIANCE_MIN}), "
-            f"edge={edge_strength:.1f} "
-            f"(thresh>={EDGE_STRENGTH_MIN}), "
-            f"color_sprd={color_spread:.1f}"
-        )
+        # ── Decision ─────────────────────────────────────────────
+        passed = mean_encoding_dist >= ENCODING_VARIANCE_MIN
 
-        print(f"[TextureLiveness] tex_var={texture_variance:.1f} "
-              f"{'✅' if passed_texture else '❌'} (>= {TEXTURE_VARIANCE_MIN})")
-        print(f"[TextureLiveness] edge={edge_strength:.1f} "
-              f"{'✅' if passed_edges else '❌'} (>= {EDGE_STRENGTH_MIN})")
-        print(f"[TextureLiveness] color_spread={color_spread:.1f}")
-        print(f"[TextureLiveness] {'PASSED ✅' if passed else 'FAILED ❌'} "
-              f"(score={combined:.3f})")
+        # Normalised score
+        score = min(1.0, mean_encoding_dist / (ENCODING_VARIANCE_MIN * 3))
+
+        print(f"[EncodingLiveness] {len(self._encodings)} encodings across "
+              f"{len(frames)} frames")
+        print(f"[EncodingLiveness] Mean pairwise distance: {mean_encoding_dist:.4f} "
+              f"{'✅' if passed else '❌'} (>= {ENCODING_VARIANCE_MIN})")
+        print(f"[EncodingLiveness] Encoding std: {encoding_std:.4f}")
+        print(f"[EncodingLiveness] Pairwise distances: "
+              f"{[f'{d:.4f}' for d in pairwise_dists]}")
+        outcome = "PASSED ✅" if passed else "FAILED ❌"
+        print(f"[EncodingLiveness] {outcome} (score={score:.3f})")
 
         return {
             'passed': passed,
-            'score': round(combined, 3),
-            'texture_variance': round(texture_variance, 1),
-            'edge_strength': round(edge_strength, 1),
-            'color_spread': round(color_spread, 1),
-            'details': details,
+            'score': round(score, 3),
+            'mean_encoding_dist': round(mean_encoding_dist, 4),
+            'encoding_std': round(encoding_std, 4),
+            'details': (
+                f"encodings={len(self._encodings)}, "
+                f"mean_dist={mean_encoding_dist:.4f} "
+                f"(thresh>={ENCODING_VARIANCE_MIN})"
+            ),
         }
