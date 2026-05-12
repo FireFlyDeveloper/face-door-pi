@@ -29,7 +29,7 @@ try:
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
     from rf_receiver import RFReceiver
-    from ir_liveness import IRLivenessDetector
+    from ir_liveness import IRLivenessDetector, POSITION_VARIANCE_MIN
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -42,7 +42,7 @@ from logger import ActivityLogger
 # ── Constants ───────────────────────────────────────────────────────────
 FRAME_RATE = 15.0
 FRAME_INTERVAL = 1.0 / FRAME_RATE
-MAX_COLLECT_FRAMES = 15        # reserved for potential multi-frame scoring
+COLLECT_DURATION = 2.5        # seconds to collect frames for motion liveness
 UNLOCK_DURATION = 1.0
 MATCH_THRESHOLD = 0.6
 
@@ -419,11 +419,17 @@ class FaceDoorSystem:
                                [f"Door: {self._lock_state.upper()}"])
 
         if face_locations:
-            print("[Main] Face detected — NoIR spectral liveness check via COLLECTING")
+            # Log detection quality: face count, size, position
+            _largest = max(face_locations,
+                           key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
+            _fw = _largest.right() - _largest.left()
+            _fh = _largest.bottom() - _largest.top()
+            print(f"[Main] Face detected ({len(face_locations)} found, "
+                  f"largest: {_fw}x{_fh}px at ({_largest.left()},{_largest.top()}))")
+            print("[Main] Transitioning: COLLECTING → NOIR liveness")
             # Store the largest face rect for spectral crop
-            self._ir_face_rect = max(face_locations,
-                                     key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
-            self._liveness_frames = []  # reset for spectral capture
+            self._ir_face_rect = _largest
+            # Reset for motion capture
             self.state = State.COLLECTING
             return
 
@@ -437,72 +443,119 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    # ── State: COLLECTING (single-frame for NoIR spectral analysis) ──
+    # ── State: COLLECTING (multi-frame face motion capture) ──────────
     def _state_collecting(self):
-        """Capture a single frame for NoIR spectral liveness detection.
+        """Capture frames for face-motion liveness analysis.
 
-        Uses the Pi NoIR camera's inherent IR sensitivity (no IR-cut filter)
-        to analyze the spectral signature of the face region.
-        Goes to LIVENESS_CHECK after capture.
+        Collects frames over COLLECT_DURATION seconds, tracking face
+        bounding box position to detect natural micro-movements.
+        Real person = positional variance from breathing/swaying.
+        Static photo/screen = near-zero variance.
+        Goes to LIVENESS_CHECK after collection.
         """
-        frame = self.camera.capture_frame()
-        if frame is None:
-            print("[Main] COLLECTING: frame capture failed")
+        self.ir_liveness.reset()
+        print(f"[Main] Collecting frames for motion liveness "
+              f"({COLLECT_DURATION:.1f}s)...")
+
+        start_time = time.time()
+        frame_idx = 0
+        best_frame = None
+        best_rect = None
+        best_area = 0
+
+        while time.time() - start_time < COLLECT_DURATION:
+            frame = self.camera.capture_frame()
+            if frame is None:
+                time.sleep(FRAME_INTERVAL)
+                continue
+
+            frame_idx += 1
+
+            # Detect faces every frame during collection
+            face_locations = self.face_recognizer.detect_faces(frame)
+            if face_locations:
+                # Track face rect for motion analysis
+                largest = max(face_locations,
+                              key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
+                self.ir_liveness.add_frame(frame, largest)
+
+                # Keep the frame with the largest face for later comparison
+                fw = largest.right() - largest.left()
+                fh = largest.bottom() - largest.top()
+                area = fw * fh
+                if area > best_area:
+                    best_area = area
+                    best_frame = frame.copy()
+                    best_rect = largest
+
+            self._show_preview(
+                frame,
+                f"COLLECTING — tracking motion ({frame_idx} frames)",
+                [f"Face tracked: {'yes' if face_locations else 'no'}"]
+            )
+
+            # Maintain collection framerate (slightly faster than main loop)
+            elapsed = time.time() - start_time
+            sleep_time = max(0, FRAME_INTERVAL * 0.8 - (time.time() - start_time - elapsed))
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+        if best_frame is not None:
+            self._latest_frame = best_frame
+            self._ir_face_rect = best_rect
+        else:
+            print("[Main] COLLECTING: no face detected in any frame")
             self.state = State.SCANNING
             return
 
-        self._liveness_frames = [frame]
-        self._latest_frame = frame
-
-        print("[Main] Frame captured — running NoIR spectral liveness")
-        self._show_preview(frame, "NOIR LIVENESS — ANALYZING",
-                           ["Single-frame spectral analysis"])
+        collected = self.ir_liveness._frame_count
+        print(f"[Main] Collected {collected} frames with faces — "
+              f"running motion liveness")
         self.state = State.LIVENESS_CHECK
 
-    # ── State: LIVENESS_CHECK (NoIR spectral analysis) ────────────────
+    # ── State: LIVENESS_CHECK (face-motion analysis) ────────────────
     def _state_liveness_check(self):
-        """Run NoIR spectral liveness analysis on the captured frame.
+        """Run face-motion liveness analysis on collected frames.
 
-        Analyzes the R/G/B channel balance in the face region to distinguish
-        live skin (R channel boosted by NIR bleed) from photos/screens.
+        Analyzes face bounding box position variance across the collection
+        window. A live person shows natural micro-movements (breathing,
+        posture sway) while a static photo has near-zero variance.
         """
-        if not self._liveness_frames:
-            print("[Main] No frame for liveness analysis — rejecting")
-            self.state = State.REJECTED
-            return
-
-        frame = self._liveness_frames[0]
-
-        if not hasattr(self, '_ir_face_rect') or self._ir_face_rect is None:
-            print("[Main] No face rect for spectral analysis — falling back to COMPARE")
-            self.state = State.COMPARE
-            return
-
-        print("[Main] Analyzing NoIR spectral liveness...")
+        print("[Main] Analyzing face-motion liveness...")
         try:
-            result = self.ir_liveness.check_liveness(frame, self._ir_face_rect)
+            result = self.ir_liveness.check_liveness()
             passed = result['passed']
             score = result['score']
-            red_dom = result['red_dominance']
-            red_excess = result['red_excess']
+            pos_var = result.get('position_variance', 0.0)
+            area_var = result.get('area_variance', 0.0)
+            pix_var = result.get('pixel_variance', 0.0)
             details = result.get('details', '')
 
-            print(f"[Main]   R/(G+B)={red_dom:.3f}, red_excess={red_excess:.3f}, score={score:.3f}")
-
             if passed:
-                print(f"[Main] NOIR SPECTRAL LIVENESS PASSED ✅ (score={score:.3f})")
-                self._show_preview(frame, "NOIR LIVENESS PASSED ✅",
-                                   [f"Score: {score:.3f}", f"R/(G+B): {red_dom:.3f}", details])
-                time.sleep(0.5)
+                print(f"[Main] MOTION LIVENESS PASSED ✅ "
+                      f"(score={score:.3f}, pos_var={pos_var:.2f}px)")
+                self._show_preview(
+                    self._latest_frame,
+                    "MOTION LIVENESS PASSED ✅",
+                    [f"Score: {score:.3f}", f"Pos variance: {pos_var:.2f}px"]
+                )
+                time.sleep(0.3)
                 self.state = State.COMPARE
             else:
-                print(f"[Main] NOIR SPECTRAL LIVENESS FAILED ❌ (score={score:.3f})")
-                self._show_preview(frame, "NOIR LIVENESS FAILED ❌",
-                                   [f"Score: {score:.3f}", f"R/(G+B): {red_dom:.3f}", details])
-                time.sleep(1)
+                print(f"[Main] MOTION LIVENESS FAILED ❌ "
+                      f"(score={score:.3f}, pos_var={pos_var:.2f}px)")
+                print(f"[Main]   (live person should have pos_var >= "
+                      f"{POSITION_VARIANCE_MIN}px)")
+                self._show_preview(
+                    self._latest_frame,
+                    "MOTION LIVENESS FAILED ❌",
+                    [f"Score: {score:.3f}",
+                     f"Pos variance: {pos_var:.2f}px (need >= {POSITION_VARIANCE_MIN})"]
+                )
+                time.sleep(1.5)
                 self.state = State.REJECTED
         except Exception as e:
-            print(f"[Main] NoIR spectral liveness error: {e}")
+            print(f"[Main] Motion liveness error: {e}")
             traceback.print_exc()
             self.state = State.REJECTED
 
@@ -516,6 +569,18 @@ class FaceDoorSystem:
             return
 
         try:
+            # Log face detection quality in the compare frame
+            _compare_faces = self.face_recognizer.detect_faces(self._latest_frame)
+            if _compare_faces:
+                _cfa = max(_compare_faces,
+                           key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
+                _cfw = _cfa.right() - _cfa.left()
+                _cfh = _cfa.bottom() - _cfa.top()
+                print(f"[Main]   Face in compare frame: {len(_compare_faces)} found, "
+                      f"largest: {_cfw}x{_cfh}px at ({_cfa.left()},{_cfa.top()})")
+            else:
+                print("[Main]   WARNING: No face detected in compare frame!")
+
             result = self.face_recognizer.get_face_encoding(self._latest_frame)
             if result is None:
                 print("[Main] Could not extract encoding, rejecting")

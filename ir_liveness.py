@@ -1,62 +1,58 @@
 """
-ir_liveness.py — NoIR spectral liveness detection (no external IR LED needed).
+ir_liveness.py — Video-based anti-fool liveness via face motion analysis.
 
-Uses the Pi NoIR camera's inherent IR sensitivity (no IR-cut filter) to
-distinguish live faces from photos/screens by analyzing the spectral
-signature of the face region in a single frame.
+Replaced NoIR spectral analysis (no IR LED available) with multi-frame
+motion-based detection. A live person exhibits natural micro-movements
+(breathing, posture sway), while a static photo/screen shows near-zero
+variance in face position and pixel content across frames.
 
 Principle:
-  The NoIR sensor captures NIR (near-infrared) light that bleeds into all
-  RGB channels, but MOST strongly into the RED channel (standard Bayer
-  pattern behavior). Real skin reflects NIR strongly, so the R channel is
-  boosted compared to G/B. Printed photos and phone screens do not reflect
-  NIR the same way, producing a different spectral balance.
+  Track face bounding box center (cx, cy) and area across N frames.
+  A live face will show measurable variance due to natural motion;
+  a printed photo or phone screen held still will be nearly static.
 
-Metrics (computed on face region):
-  1. Red Dominance Ratio: R / (G + B + eps)  — higher for live skin (NIR boost)
-  2. R-G Mean Difference: mean(R) - mean(G)  — positive is typical for skin
-  3. Red Excess Index: (2*R - G - B) / (R + G + B + eps)  — normalised
+Metrics (computed across all frames in a collection window):
+  1. Position variance: std(cx) + std(cy) — live > threshold
+  2. Area variance: std(area) / mean(area) — normalised size fluctuation
+  3. Pixel variance: mean absolute diff between consecutive face crops
 
 Public interface:
-  check_liveness(frame, face_rect) -> dict
+  IRLivenessDetector.check_liveness(frames: list, face_rects: list) -> dict
+  IRLivenessDetector.reset()
 """
 
 from __future__ import annotations
 
 import cv2
 import numpy as np
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
+
 
 # ── Thresholds (tune empirically) ───────────────────────────────────────
-# Under NoIR, live skin typically has R channel boosted by NIR bleed
-RED_DOMINANCE_MIN = 0.38      # min R/(G+B) ratio for live skin
-RED_EXCESS_MIN = 0.0          # min (2R-G-B)/(R+G+B) normalised excess
-MIN_FACE_REGION = 100         # minimum face crop pixels
+# Total positional jitter needed to pass (std_x + std_y in pixels)
+POSITION_VARIANCE_MIN = 2.0   # sum of std(cx) + std(cy)
+# Minimum number of frames required for a valid check
+MIN_FRAMES = 10
+# Face rect area as percentage of total frame — below this is too small
+MIN_FACE_AREA_RATIO = 0.01     # 1% of 640x480 = ~3072px
 
 # Debug: print per-frame metrics
 _DEBUG = False
 
 
-def _face_region(bgr: np.ndarray, face_rect) -> Optional[np.ndarray]:
-    """Extract the face region from a BGR frame given a dlib rect."""
-    h, w = bgr.shape[:2]
-    x1 = max(face_rect.left(), 0)
-    y1 = max(face_rect.top(), 0)
-    x2 = min(face_rect.right(), w)
-    y2 = min(face_rect.bottom(), h)
-
-    if x2 <= x1 or y2 <= y1:
-        return None
-
-    crop = bgr[y1:y2, x1:x2]
-    if crop.size < MIN_FACE_REGION:
-        return None
-
-    return crop
-
-
 class IRLivenessDetector:
-    """NoIR spectral liveness detector — single-frame, no external IR LED."""
+    """Video-based anti-fool liveness via face motion analysis.
+
+    Collects a sequence of face detections across multiple frames and
+    analyzes positional variance to distinguish live persons from static
+    photos or screens.
+
+    Usage:
+        detector = IRLivenessDetector()
+        detector.reset()
+        # ... collect frames in a loop ...
+        result = detector.check_liveness(frames, face_rects)
+    """
 
     def __init__(self, debug: bool = False):
         global _DEBUG
@@ -64,86 +60,140 @@ class IRLivenessDetector:
         self.reset()
 
     def reset(self):
-        """Clear between checks."""
-        pass
+        """Clear state between liveness checks."""
+        self._frame_count = 0
+        self._centers: List[Tuple[float, float]] = []  # (cx, cy)
+        self._areas: List[float] = []                   # bounding box area
+        self._face_crops: List[np.ndarray] = []         # aligned face crops
+
+    def add_frame(self, frame: np.ndarray, face_rect) -> bool:
+        """Process one frame during collection.
+
+        Args:
+            frame: BGR numpy array.
+            face_rect: dlib rectangle of the detected face.
+
+        Returns:
+            True if the frame was valid and added, False otherwise.
+        """
+        h, w = frame.shape[:2]
+        x1 = max(face_rect.left(), 0)
+        y1 = max(face_rect.top(), 0)
+        x2 = min(face_rect.right(), w)
+        y2 = min(face_rect.bottom(), h)
+
+        if x2 <= x1 or y2 <= y1:
+            return False
+
+        face_w = x2 - x1
+        face_h = y2 - y1
+        area = face_w * face_h
+
+        # Reject tiny detections
+        if area < MIN_FACE_AREA_RATIO * w * h:
+            return False
+
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+
+        self._centers.append((cx, cy))
+        self._areas.append(float(area))
+        self._face_crops.append(frame[y1:y2, x1:x2])
+        self._frame_count += 1
+        return True
 
     def check_liveness(
         self,
-        frame: np.ndarray,
-        face_rect,
+        frames: Optional[List[np.ndarray]] = None,
+        face_rects: Optional[List] = None,
     ) -> Dict:
-        """Analyze a single BGR frame for NoIR spectral liveness.
+        """Analyze collected frames for face-motion liveness.
+
+        If frames and face_rects are provided, they are processed
+        immediately (batch mode). Otherwise, uses the accumulated
+        frames from add_frame().
 
         Args:
-            frame: BGR numpy array (from Pi NoIR camera).
-            face_rect: dlib rectangle of the detected face.
+            frames: Optional list of BGR frames.
+            face_rects: Optional list of dlib rectangles (same length).
 
         Returns:
             dict with: passed, score, metrics, details.
         """
-        crop = _face_region(frame, face_rect)
-        if crop is None:
+        # Batch mode: process all at once
+        if frames is not None and face_rects is not None:
+            self.reset()
+            for f, r in zip(frames, face_rects):
+                if r is not None:
+                    self.add_frame(f, r)
+
+        if self._frame_count < MIN_FRAMES:
             return {
                 'passed': False,
                 'score': 0.0,
-                'red_dominance': 0.0,
-                'red_excess': 0.0,
-                'details': 'face region too small',
+                'details': f'insufficient frames ({self._frame_count} < {MIN_FRAMES})',
+                'blinks_detected': 0,
+                'position_variance': 0.0,
+                'area_variance': 0.0,
+                'pixel_variance': 0.0,
             }
 
-        # Split channels and convert to float
-        b = crop[:, :, 0].astype(np.float32)
-        g = crop[:, :, 1].astype(np.float32)
-        r = crop[:, :, 2].astype(np.float32)
+        # ── Metric 1: Position Variance ──────────────────────────
+        cx_arr = np.array([c[0] for c in self._centers])
+        cy_arr = np.array([c[1] for c in self._centers])
+        pos_variance = float(np.std(cx_arr) + np.std(cy_arr))
 
-        mean_r = float(np.mean(r))
-        mean_g = float(np.mean(g))
-        mean_b = float(np.mean(b))
-        total = mean_r + mean_g + mean_b + 1e-8
+        # ── Metric 2: Area Variance (normalised) ─────────────────
+        area_arr = np.array(self._areas)
+        mean_area = float(np.mean(area_arr))
+        area_variance = float(np.std(area_arr) / mean_area) if mean_area > 0 else 0.0
 
-        # ── Metric 1: Red Dominance ────────────────────────────────
-        # R/(G+B) — live skin gets NIR boost in R channel
-        red_dominance = mean_r / (mean_g + mean_b + 1e-8)
+        # ── Metric 3: Pixel Variance (frame-to-frame diff) ───────
+        pixel_variance = 0.0
+        if len(self._face_crops) >= 3:
+            diffs = []
+            for i in range(1, len(self._face_crops)):
+                # Resize to uniform size for comparison
+                prev = cv2.resize(self._face_crops[i - 1], (100, 100))
+                curr = cv2.resize(self._face_crops[i], (100, 100))
+                diff = cv2.absdiff(prev, curr)
+                diffs.append(float(np.mean(diff)))
+            pixel_variance = float(np.mean(diffs)) if diffs else 0.0
 
-        # ── Metric 2: R-G mean difference ──────────────────────────
-        rg_diff = mean_r - mean_g
+        # ── Decision ─────────────────────────────────────────────
+        passed = pos_variance >= POSITION_VARIANCE_MIN
 
-        # ── Metric 3: Normalised Red Excess ─────────────────────────
-        # (2R - G - B) / (R + G + B) — standard vegetation index adapted
-        red_excess = (2.0 * mean_r - mean_g - mean_b) / total
-
-        # ── Decision ───────────────────────────────────────────────
-        passed_dominance = red_dominance >= RED_DOMINANCE_MIN
-        passed_excess = red_excess >= RED_EXCESS_MIN
-
-        # Combined score: weighted average of normalised metrics
-        dom_score = max(0.0, min(1.0, red_dominance / (RED_DOMINANCE_MIN * 1.5)))
-        # Avoid division by zero when RED_EXCESS_MIN == 0
-        if RED_EXCESS_MIN > 0:
-            exc_score = max(0.0, min(1.0, red_excess / (RED_EXCESS_MIN * 1.5)))
-        else:
-            exc_score = 1.0 if red_excess >= 0 else 0.0
-        combined = (dom_score * 0.6) + (exc_score * 0.4)
-
-        passed = passed_dominance and passed_excess
+        # Combined score (0-1)
+        pos_score = min(1.0, pos_variance / (POSITION_VARIANCE_MIN * 3))
+        area_score = min(1.0, area_variance * 50)  # normalised boost
+        pix_score = min(1.0, pixel_variance / 10.0)
+        combined = (pos_score * 0.6) + (area_score * 0.2) + (pix_score * 0.2)
 
         details = (
-            f"R/G/B={mean_r:.0f}/{mean_g:.0f}/{mean_b:.0f} "
-            f"R/(G+B)={red_dominance:.3f} "
-            f"(thresh>={RED_DOMINANCE_MIN}), "
-            f"R-G={rg_diff:.1f}, "
-            f"red_excess={red_excess:.3f} "
-            f"(thresh>={RED_EXCESS_MIN})"
+            f"frames={self._frame_count} "
+            f"pos_var={pos_variance:.2f}px "
+            f"(thresh>={POSITION_VARIANCE_MIN}), "
+            f"area_var={area_variance:.4f}, "
+            f"pix_var={pixel_variance:.2f}"
         )
 
         if _DEBUG:
-            print(f"[IR] {details}")
+            print(f"[Liveness] {details}")
+
+        # Log individual frame centers for diagnostics
+        center_log = ", ".join(
+            f"({c[0]:.0f},{c[1]:.0f})" for c in self._centers
+        )
+        print(f"[Liveness] Centers: [{center_log}]")
+        print(f"[Liveness] Position variance: {pos_variance:.2f}px "
+              f"{'✅ PASS' if passed else '❌ FAIL'} "
+              f"(threshold >= {POSITION_VARIANCE_MIN})")
 
         return {
             'passed': passed,
-            'score': combined,
-            'red_dominance': red_dominance,
-            'rg_diff': rg_diff,
-            'red_excess': red_excess,
+            'score': round(combined, 3),
+            'position_variance': round(pos_variance, 2),
+            'area_variance': round(area_variance, 4),
+            'pixel_variance': round(pixel_variance, 2),
             'details': details,
         }
