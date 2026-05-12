@@ -202,8 +202,8 @@ class FaceDoorSystem:
 
         # Draw face detections
         if hasattr(self, '_last_face_locations') and self._last_face_locations:
-            for rect in self._last_face_locations:
-                x1, y1, x2, y2 = rect.left(), rect.top(), rect.right(), rect.bottom()
+            for face_dict in self._last_face_locations:
+                x1, y1, x2, y2 = face_dict['bbox']
                 cv2.rectangle(display, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
         cv2.imshow(CV2_WINDOW, display)
@@ -379,12 +379,12 @@ class FaceDoorSystem:
             print(f"[Main] BT processing error: {e}")
 
     # ── Helper: crop face from frame ─────────────────────────────────
-    def _crop_face(self, frame: np.ndarray, rect) -> np.ndarray:
-        """Crop face region from frame using a dlib rectangle."""
-        x1 = max(0, rect.left())
-        y1 = max(0, rect.top())
-        x2 = min(frame.shape[1], rect.right())
-        y2 = min(frame.shape[0], rect.bottom())
+    def _crop_face(self, frame: np.ndarray, bbox) -> np.ndarray:
+        """Crop face region from frame using bbox [x1, y1, x2, y2]."""
+        x1 = max(0, int(bbox[0]))
+        y1 = max(0, int(bbox[1]))
+        x2 = min(frame.shape[1], int(bbox[2]))
+        y2 = min(frame.shape[0], int(bbox[3]))
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return frame  # fallback: whole frame
@@ -427,13 +427,13 @@ class FaceDoorSystem:
                                [f"Door: {self._lock_state.upper()}"])
 
         if face_locations:
-            # Log detection quality
+            # Log detection quality: face count, size, position
             _largest = max(face_locations,
-                           key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
-            _fw = _largest.right() - _largest.left()
-            _fh = _largest.bottom() - _largest.top()
+                           key=lambda f: (f['bbox'][2]-f['bbox'][0])*(f['bbox'][3]-f['bbox'][1]))
+            _fw = _largest['bbox'][2] - _largest['bbox'][0]
+            _fh = _largest['bbox'][3] - _largest['bbox'][1]
             print(f"[Main] Face detected ({len(face_locations)} found, "
-                  f"largest: {_fw}x{_fh}px at ({_largest.left()},{_largest.top()}))")
+                  f"largest: {_fw}x{_fh}px at ({_largest['bbox'][0]},{_largest['bbox'][1]}))")
             print("[Main] Transitioning: SCANNING → COMPARE (anti-spoof + ArcFace)")
             self.state = State.COMPARE
             return
@@ -462,7 +462,7 @@ class FaceDoorSystem:
         frame = self._latest_frame
 
         try:
-            # ── Stage 1: Face Detection ──────────────────────────────
+            # ── Single call: RetinaFace detects + ArcFace encodes ─────
             t1 = time.perf_counter()
             faces = self.face_recognizer.detect_faces(frame)
             t_detect_ms = (time.perf_counter() - t1) * 1000
@@ -474,10 +474,16 @@ class FaceDoorSystem:
 
             largest_face = max(
                 faces,
-                key=lambda r: (r.right()-r.left()) * (r.bottom()-r.top()),
+                key=lambda f: (f['bbox'][2]-f['bbox'][0]) *
+                              (f['bbox'][3]-f['bbox'][1]),
             )
-            face_crop = self._crop_face(frame, largest_face)
-            print(f"[Main]   Face crop: {face_crop.shape[1]}x{face_crop.shape[0]}px")
+            bbox = largest_face['bbox']
+            embedding = largest_face['embedding']
+            det_score = largest_face['det_score']
+            face_crop = self._crop_face(frame, bbox)
+            print(f"[Main]   RetinaFace: {len(faces)} face(s), "
+                  f"largest at ({bbox[0]},{bbox[1]}-{bbox[2]},{bbox[3]}), "
+                  f"conf={det_score:.2f}, crop={face_crop.shape[1]}x{face_crop.shape[0]}px")
 
             # ── Stage 2: Anti-Spoof ──────────────────────────────────
             t1 = time.perf_counter()
@@ -503,50 +509,42 @@ class FaceDoorSystem:
                 self.state = State.REJECTED
                 return
 
-            # ── Stage 3: ArcFace Encoding ────────────────────────────
-            t1 = time.perf_counter()
-            result = self.face_recognizer.get_face_encoding(frame)
-            t_encode_ms = (time.perf_counter() - t1) * 1000
+            # ── Stage 3: Encoding (already from RetinaFace) ──────
+            t_encode_ms = 0.0  # embedding included in detect_faces call
 
-            if result is None:
-                print("[Main]   Could not extract ArcFace encoding")
-                self.state = State.REJECTED
-                return
-
-            encoding, _ = result
-
-            # ── Stage 4: Matching (Euclidean distance for dlib 128-D) ──
+            # ── Stage 4: Matching (cosine sim for ArcFace 512-D) ──
             t1 = time.perf_counter()
             stored_faces = self.face_storage.list_faces()
             best_match = None
-            best_dist = float('inf')
+            best_sim = -1.0
 
             if stored_faces:
                 for face_id, face_data in stored_faces.items():
                     for stored_enc in face_data.get('encoding', []):
-                        dist = float(np.linalg.norm(encoding - stored_enc))
-                        if dist < best_dist:
-                            best_dist = dist
+                        # Cosine similarity (ArcFace embeddings are L2-normed)
+                        sim = float(np.dot(embedding, stored_enc))
+                        if sim > best_sim:
+                            best_sim = sim
                             best_match = face_id
 
             t_match_ms = (time.perf_counter() - t1) * 1000
 
             # ── Decision ─────────────────────────────────────────────
-            granted = best_match is not None and best_dist < MATCH_THRESHOLD
+            granted = best_match is not None and best_sim >= MATCH_THRESHOLD
 
             if granted:
-                print(f"[Main]   Match: {best_match} (dist={best_dist:.4f}) — GRANTED")
+                print(f"[Main]   Match: {best_match} (cos sim={best_sim:.4f}) — GRANTED")
                 self._matched_id = best_match
-                self._last_distance = best_dist
+                self._last_distance = 1.0 - best_sim  # store as dissimilarity
                 self._show_preview(frame, f"MATCH: {best_match} ✅",
-                                   [f"Distance: {best_dist:.3f}",
+                                   [f"Score: {best_sim:.3f}",
                                     f"Threshold: {MATCH_THRESHOLD}"])
                 self.state = State.GRANTED
             else:
-                reason = "no_stored_faces" if not stored_faces else f"dist={best_dist:.4f}"
+                reason = "no_stored_faces" if not stored_faces else f"sim={best_sim:.4f}"
                 print(f"[Main]   No match ({reason}) — REJECTED")
                 self._show_preview(frame, "NO MATCH ❌",
-                                   [f"Best distance: {best_dist:.3f}",
+                                   [f"Best similarity: {best_sim:.3f}",
                                     f"Threshold: {MATCH_THRESHOLD}"])
                 self.state = State.REJECTED
 
@@ -559,7 +557,7 @@ class FaceDoorSystem:
                 anti_spoof_score=live_score,
                 is_live=True,
                 match_id=best_match if granted else None,
-                match_distance=best_dist if not granted else None,
+                match_distance=1.0 - best_sim if not granted else None,
                 result="GRANTED" if granted else "REJECTED",
             )
 
