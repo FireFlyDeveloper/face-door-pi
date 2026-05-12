@@ -144,12 +144,17 @@ class AntiSpoofDetector:
         return score
 
     def _preprocess_onnx(self, face_img: np.ndarray) -> np.ndarray:
-        """Preprocess face crop for MiniFASNet ONNX."""
+        """Preprocess face crop for MiniFASNet ONNX.
+
+        NOTE: MiniFASNet was trained with [0, 255] float inputs (no /255.0).
+        The original ``to_tensor()`` in Silent-Face-Anti-Spoofing returns raw
+        uint8 values cast to float32 without dividing by 255.
+        """
         w, h = ONNX_INPUT_SIZE
         img = cv2.resize(face_img, (w, h))
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = img.astype(np.float32)
-        img = img / 255.0
+        # NO /255.0 — MiniFASNet expects [0, 255] range
         # MiniFASNet uses (1, 3, H, W) format (NCHW)
         img = np.transpose(img, (2, 0, 1))
         img = np.expand_dims(img, axis=0)
