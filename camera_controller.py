@@ -7,6 +7,7 @@ Supports context manager, single frame, and burst capture at ~30fps.
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional
 
 import cv2
@@ -29,6 +30,9 @@ class CameraController:
         self.resolution = resolution
         self.framerate = framerate
         self._camera = None
+        # High-res config for liveness capture (full sensor detail)
+        self._liveness_res = (1640, 1232)
+        self._liveness_config = None
 
     def start(self) -> bool:
         """Start the camera with configured resolution and framerate."""
@@ -84,6 +88,68 @@ class CameraController:
             return bgr
         except Exception as exc:
             logger.error("Failed to capture frame: %s", exc)
+            return None
+
+    def capture_liveness_frame(self) -> Optional[np.ndarray]:
+        """Capture a single high-res frame (1640x1232) for texture liveness.
+
+        Temporarily reconfigures camera to full sensor detail mode,
+        captures one frame, then restores normal 640x480 mode.
+        Takes ~0.5s for the reconfiguration.
+
+        Returns:
+            np.ndarray in BGR format (1232x1640x3), or None on failure.
+        """
+        if self._camera is None:
+            logger.warning("Camera not started")
+            return None
+
+        try:
+            from libcamera import Transform
+
+            # ── Switch to high-res ──
+            self._camera.stop()
+            hires = self._camera.create_video_configuration(
+                main={"size": self._liveness_res, "format": "RGB888"},
+                controls={"FrameRate": 10},
+                transform=Transform(),
+            )
+            self._camera.configure(hires)
+            self._camera.start()
+            # Wait for AEC/AGC to settle at new resolution
+            time.sleep(0.3)
+
+            rgb = self._camera.capture_array()
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            logger.info("Captured liveness frame at %s", self._liveness_res)
+
+            # ── Restore normal resolution ──
+            self._camera.stop()
+            normal = self._camera.create_video_configuration(
+                main={"size": self.resolution, "format": "RGB888"},
+                controls={"FrameRate": self.framerate},
+                transform=Transform(),
+            )
+            self._camera.configure(normal)
+            self._camera.start()
+
+            return bgr
+
+        except Exception as exc:
+            logger.error("Failed to capture liveness frame: %s", exc)
+            # Attempt to restore normal mode
+            try:
+                self._camera.stop()
+                from libcamera import Transform
+                normal = self._camera.create_video_configuration(
+                    main={"size": self.resolution, "format": "RGB888"},
+                    controls={"FrameRate": self.framerate},
+                    transform=Transform(),
+                )
+                self._camera.configure(normal)
+                self._camera.start()
+            except Exception:
+                pass
             return None
 
     def capture_frames(self, count: int = 30) -> List[np.ndarray]:

@@ -1,18 +1,15 @@
 """
-ir_liveness.py — Single-frame anti-fool liveness via texture/edge analysis.
+ir_liveness.py — High-res texture/edge anti-fool liveness detection.
 
-Replaced motion-based approach (too slow, required movement) with a
-single-frame passive texture analysis. Distinguishes live faces from
-printed photos and screen replays by analyzing:
+Uses the IMX219 at 1640x1232 (full sensor detail) to capture enough
+texture information to distinguish live faces from printed photos or
+phone screen replays via:
 
-1. Texture variance (Laplacian): Real skin has fine details (pores, hair)
-   producing high-frequency content. Printed paper is flat/smooth.
-2. Edge sharpness (Sobel): Real face edges are natural. Screen replays
-   have pixel grid artifacts and oversharpened edges.
-3. Color saturation spread: Real skin has natural color variation.
-   Printed/screen reproductions have compressed or artificial gamut.
-
-All metrics computed on a single frame — zero delay, no user movement.
+1. Texture variance (Laplacian): Real skin has fine pores, hair, and
+   micro-texture at full resolution. Printed paper is flat/smooth.
+   Phone screens have pixel grid artifacts at high magnification.
+2. Edge sharpness (Sobel): Natural skin edges vs artificial reproductions.
+3. Color saturation spread: Natural skin color distribution.
 
 Public interface:
   IRLivenessDetector.check_liveness(frame, face_rect) -> dict
@@ -23,13 +20,13 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 
-# ── Thresholds (tune empirically for Pi NoIR cam 640x480) ──────────────
-TEXTURE_VARIANCE_MIN = 2.5     # Laplacian variance — live skin > printed (v2 cam @640x480: ~3.6)
-EDGE_STRENGTH_MIN = 4.0        # Mean Sobel magnitude (v2 cam @640x480: ~5.4)
-MIN_FACE_REGION = 100          # Minimum face crop pixels
+# ── Thresholds (tune empirically for Pi Cam v2 @ 1640x1232) ────────────
+TEXTURE_VARIANCE_MIN = 20.0    # Laplacian variance — real skin has detail
+EDGE_STRENGTH_MIN = 20.0       # Mean Sobel magnitude
+MIN_FACE_REGION = 100          # minimum face crop pixels
 
 
 _DEBUG = False
@@ -54,11 +51,7 @@ def _face_region(bgr: np.ndarray, face_rect) -> Optional[np.ndarray]:
 
 
 class IRLivenessDetector:
-    """Single-frame texture/edge anti-fool liveness detector.
-
-    Uses texture variance analysis to distinguish live faces from
-    printed photos or screen replays in a single frame.
-    """
+    """High-res texture/edge anti-fool liveness detector."""
 
     def __init__(self, debug: bool = False):
         global _DEBUG
@@ -66,7 +59,7 @@ class IRLivenessDetector:
         self.reset()
 
     def reset(self):
-        """Clear state between checks."""
+        """Clear between checks."""
         pass
 
     def check_liveness(
@@ -74,10 +67,10 @@ class IRLivenessDetector:
         frame: np.ndarray,
         face_rect,
     ) -> Dict:
-        """Analyze a single BGR frame for texture-based liveness.
+        """Analyze a single high-res BGR frame for texture-based liveness.
 
         Args:
-            frame: BGR numpy array.
+            frame: BGR numpy array (1640x1232 recommended).
             face_rect: dlib rectangle of the detected face.
 
         Returns:
@@ -113,11 +106,8 @@ class IRLivenessDetector:
         # ── Decision ───────────────────────────────────────────────
         passed_texture = texture_variance >= TEXTURE_VARIANCE_MIN
         passed_edges = edge_strength >= EDGE_STRENGTH_MIN
-
-        # Pass requires texture variance AND either edge or color metric
         passed = passed_texture and passed_edges
 
-        # Combined score (0-1) — weighted average of normalised metrics
         tex_score = min(1.0, texture_variance / (TEXTURE_VARIANCE_MIN * 2))
         edge_score = min(1.0, edge_strength / (EDGE_STRENGTH_MIN * 2))
         col_score = min(1.0, color_spread / 40.0)
@@ -131,18 +121,13 @@ class IRLivenessDetector:
             f"color_sprd={color_spread:.1f}"
         )
 
-        if _DEBUG:
-            print(f"[TextureLiveness] {details}")
-
-        print(f"[Liveness] Texture variance: {texture_variance:.1f} "
-              f"{'✅' if passed_texture else '❌'} "
-              f"(threshold >= {TEXTURE_VARIANCE_MIN})")
-        print(f"[Liveness] Edge strength: {edge_strength:.1f} "
-              f"{'✅' if passed_edges else '❌'} "
-              f"(threshold >= {EDGE_STRENGTH_MIN})")
-        print(f"[Liveness] Color spread: {color_spread:.1f}")
-        outcome = "PASSED ✅" if passed else "FAILED ❌"
-        print(f"[Liveness] {outcome} (score={combined:.3f})")
+        print(f"[TextureLiveness] tex_var={texture_variance:.1f} "
+              f"{'✅' if passed_texture else '❌'} (>= {TEXTURE_VARIANCE_MIN})")
+        print(f"[TextureLiveness] edge={edge_strength:.1f} "
+              f"{'✅' if passed_edges else '❌'} (>= {EDGE_STRENGTH_MIN})")
+        print(f"[TextureLiveness] color_spread={color_spread:.1f}")
+        print(f"[TextureLiveness] {'PASSED ✅' if passed else 'FAILED ❌'} "
+              f"(score={combined:.3f})")
 
         return {
             'passed': passed,
