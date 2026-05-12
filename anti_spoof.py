@@ -125,10 +125,14 @@ class AntiSpoofDetector:
         inputs = self._preprocess_onnx(face_img)
         output = self._session.run(None, {self._input_name: inputs})
 
-        # MiniFASNet outputs [spoof_prob, live_prob] or single sigmoid
+        # MiniFASNet outputs: [spoof, ?, live] or [spoof_spoof, ~, live]
         out = output[0]
-        if out.shape[-1] >= 2:
-            # Take softmax of two-class output
+        if out.shape[-1] >= 3:
+            # 3-class: index 2 is live
+            scores = out[0]
+            exp_scores = np.exp(scores - np.max(scores))
+            live_score = float(exp_scores[2] / np.sum(exp_scores))
+        elif out.shape[-1] == 2:
             scores = out[0]
             exp_scores = np.exp(scores - np.max(scores))
             live_score = float(exp_scores[1] / np.sum(exp_scores))
