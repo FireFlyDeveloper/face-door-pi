@@ -29,7 +29,7 @@ try:
     from face_storage import FaceStorage
     from face_recognizer import FaceRecognizer
     from rf_receiver import RFReceiver
-    from ir_liveness import IRLivenessDetector, POSITION_VARIANCE_MIN
+    from ir_liveness import IRLivenessDetector, TEXTURE_VARIANCE_MIN, EDGE_STRENGTH_MIN
 except ImportError as e:
     print(f"[Main] FATAL: Could not import sibling modules: {e}")
     print("[Main] Make sure all modules exist in", PROJECT_DIR)
@@ -443,119 +443,77 @@ class FaceDoorSystem:
 
         self._process_bt_client()
 
-    # ── State: COLLECTING (multi-frame face motion capture) ──────────
+    # ── State: COLLECTING (single-frame for texture/color liveness) ──
     def _state_collecting(self):
-        """Capture frames for face-motion liveness analysis.
+        """Capture a single frame for texture-based liveness detection.
 
-        Collects frames over COLLECT_DURATION seconds, tracking face
-        bounding box position to detect natural micro-movements.
-        Real person = positional variance from breathing/swaying.
-        Static photo/screen = near-zero variance.
-        Goes to LIVENESS_CHECK after collection.
+        Analyzes face region texture variance to distinguish live skin
+        from printed photos or screen replays.
+        Goes to LIVENESS_CHECK after capture.
         """
-        self.ir_liveness.reset()
-        print(f"[Main] Collecting frames for motion liveness "
-              f"({COLLECT_DURATION:.1f}s)...")
-
-        start_time = time.time()
-        frame_idx = 0
-        best_frame = None
-        best_rect = None
-        best_area = 0
-
-        while time.time() - start_time < COLLECT_DURATION:
-            frame = self.camera.capture_frame()
-            if frame is None:
-                time.sleep(FRAME_INTERVAL)
-                continue
-
-            frame_idx += 1
-
-            # Detect faces every frame during collection
-            face_locations = self.face_recognizer.detect_faces(frame)
-            if face_locations:
-                # Track face rect for motion analysis
-                largest = max(face_locations,
-                              key=lambda r: (r.right()-r.left())*(r.bottom()-r.top()))
-                self.ir_liveness.add_frame(frame, largest)
-
-                # Keep the frame with the largest face for later comparison
-                fw = largest.right() - largest.left()
-                fh = largest.bottom() - largest.top()
-                area = fw * fh
-                if area > best_area:
-                    best_area = area
-                    best_frame = frame.copy()
-                    best_rect = largest
-
-            self._show_preview(
-                frame,
-                f"COLLECTING — tracking motion ({frame_idx} frames)",
-                [f"Face tracked: {'yes' if face_locations else 'no'}"]
-            )
-
-            # Maintain collection framerate (slightly faster than main loop)
-            elapsed = time.time() - start_time
-            sleep_time = max(0, FRAME_INTERVAL * 0.8 - (time.time() - start_time - elapsed))
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-
-        if best_frame is not None:
-            self._latest_frame = best_frame
-            self._ir_face_rect = best_rect
-        else:
-            print("[Main] COLLECTING: no face detected in any frame")
+        frame = self.camera.capture_frame()
+        if frame is None:
+            print("[Main] COLLECTING: frame capture failed")
             self.state = State.SCANNING
             return
 
-        collected = self.ir_liveness._frame_count
-        print(f"[Main] Collected {collected} frames with faces — "
-              f"running motion liveness")
+        self._latest_frame = frame
+        print("[Main] Frame captured — running texture liveness")
+        self._show_preview(frame, "TEXTURE LIVENESS — ANALYZING",
+                           ["Single-frame texture analysis"])
         self.state = State.LIVENESS_CHECK
 
-    # ── State: LIVENESS_CHECK (face-motion analysis) ────────────────
+    # ── State: LIVENESS_CHECK (single-frame texture/edge analysis) ──
     def _state_liveness_check(self):
-        """Run face-motion liveness analysis on collected frames.
+        """Run single-frame texture/edge liveness analysis.
 
-        Analyzes face bounding box position variance across the collection
-        window. A live person shows natural micro-movements (breathing,
-        posture sway) while a static photo has near-zero variance.
+        Analyzes face region texture variance (Laplacian) and edge
+        sharpness (Sobel) to distinguish live skin from printed photos
+        or screen replays in a single frame.
         """
-        print("[Main] Analyzing face-motion liveness...")
+        if not hasattr(self, '_ir_face_rect') or self._ir_face_rect is None:
+            print("[Main] No face rect for texture analysis — falling back to COMPARE")
+            self.state = State.COMPARE
+            return
+
+        print("[Main] Analyzing face texture liveness...")
         try:
-            result = self.ir_liveness.check_liveness()
+            result = self.ir_liveness.check_liveness(
+                self._latest_frame, self._ir_face_rect
+            )
             passed = result['passed']
             score = result['score']
-            pos_var = result.get('position_variance', 0.0)
-            area_var = result.get('area_variance', 0.0)
-            pix_var = result.get('pixel_variance', 0.0)
-            details = result.get('details', '')
+            tex_var = result.get('texture_variance', 0.0)
+            edge_str = result.get('edge_strength', 0.0)
+            col_sprd = result.get('color_spread', 0.0)
 
             if passed:
-                print(f"[Main] MOTION LIVENESS PASSED ✅ "
-                      f"(score={score:.3f}, pos_var={pos_var:.2f}px)")
+                print(f"[Main] TEXTURE LIVENESS PASSED ✅ "
+                      f"(score={score:.3f})")
                 self._show_preview(
                     self._latest_frame,
-                    "MOTION LIVENESS PASSED ✅",
-                    [f"Score: {score:.3f}", f"Pos variance: {pos_var:.2f}px"]
+                    "TEXTURE LIVENESS PASSED ✅",
+                    [f"Score: {score:.3f}",
+                     f"Texture: {tex_var:.1f}",
+                     f"Edge: {edge_str:.1f}"]
                 )
                 time.sleep(0.3)
                 self.state = State.COMPARE
             else:
-                print(f"[Main] MOTION LIVENESS FAILED ❌ "
-                      f"(score={score:.3f}, pos_var={pos_var:.2f}px)")
-                print(f"[Main]   (live person should have pos_var >= "
-                      f"{POSITION_VARIANCE_MIN}px)")
+                print(f"[Main] TEXTURE LIVENESS FAILED ❌ "
+                      f"(score={score:.3f}, tex_var={tex_var:.1f}, "
+                      f"edge={edge_str:.1f})")
                 self._show_preview(
                     self._latest_frame,
-                    "MOTION LIVENESS FAILED ❌",
+                    "TEXTURE LIVENESS FAILED ❌",
                     [f"Score: {score:.3f}",
-                     f"Pos variance: {pos_var:.2f}px (need >= {POSITION_VARIANCE_MIN})"]
+                     f"Texture: {tex_var:.1f} (need >= {TEXTURE_VARIANCE_MIN})",
+                     f"Edge: {edge_str:.1f} (need >= {EDGE_STRENGTH_MIN})"]
                 )
                 time.sleep(1.5)
                 self.state = State.REJECTED
         except Exception as e:
-            print(f"[Main] Motion liveness error: {e}")
+            print(f"[Main] Texture liveness error: {e}")
             traceback.print_exc()
             self.state = State.REJECTED
 
