@@ -81,7 +81,7 @@ class AntiSpoofDetector:
 
         if self._has_onnx:
             combined = ONNX_WEIGHT * onnx_score + LBP_WEIGHT * lbp_score
-            log.debug("AntiSpoof: ONNX=%.3f LBP=%.3f combined=%.3f",
+            log.info("AntiSpoof: ONNX=%.3f LBP=%.3f combined=%.3f",
                       onnx_score, lbp_score, combined)
             return float(np.clip(combined, 0.0, 1.0))
 
