@@ -27,8 +27,8 @@ from typing import Dict, Optional, Tuple
 
 
 # ── Thresholds (tune empirically for Pi NoIR cam 640x480) ──────────────
-TEXTURE_VARIANCE_MIN = 8.0     # Laplacian variance — live skin > printed
-EDGE_STRENGTH_MIN = 15.0       # Mean Sobel magnitude
+TEXTURE_VARIANCE_MIN = 2.5     # Laplacian variance — live skin > printed (v2 cam @640x480: ~3.6)
+EDGE_STRENGTH_MIN = 4.0        # Mean Sobel magnitude (v2 cam @640x480: ~5.4)
 MIN_FACE_REGION = 100          # Minimum face crop pixels
 
 
@@ -118,8 +118,8 @@ class IRLivenessDetector:
         passed = passed_texture and passed_edges
 
         # Combined score (0-1) — weighted average of normalised metrics
-        tex_score = min(1.0, texture_variance / (TEXTURE_VARIANCE_MIN * 3))
-        edge_score = min(1.0, edge_strength / (EDGE_STRENGTH_MIN * 3))
+        tex_score = min(1.0, texture_variance / (TEXTURE_VARIANCE_MIN * 2))
+        edge_score = min(1.0, edge_strength / (EDGE_STRENGTH_MIN * 2))
         col_score = min(1.0, color_spread / 40.0)
         combined = (tex_score * 0.5) + (edge_score * 0.3) + (col_score * 0.2)
 
