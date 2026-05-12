@@ -87,7 +87,7 @@ class FaceStorage:
                     self.logger.warning(f"Corrupt entry for '{face_id}' — removing")
                     del data[face_id]
                     continue
-                # Ensure encoding is list of 10 lists of 128 floats
+                # Ensure encoding is list of 10 lists of 512 floats
                 enc_list = face_data["encoding"]
                 if not isinstance(enc_list, list) or len(enc_list) != 10:
                     self.logger.warning(
@@ -129,7 +129,7 @@ class FaceStorage:
 
         Args:
             face_id: Unique identifier (e.g. 'alice' or 'uuid-...').
-            encoding_list: Exactly 10 np.ndarrays, each 128-D.
+            encoding_list: Exactly 10 np.ndarrays, each 128-D or 512-D.
             metadata: Optional dict of extra info (name, timestamp, etc.).
 
         Returns:
@@ -143,8 +143,8 @@ class FaceStorage:
                 f"encoding_list must be a list of 10 arrays, got {len(encoding_list)}"
             )
         for i, enc in enumerate(encoding_list):
-            if not isinstance(enc, np.ndarray) or enc.shape != (128,):
-                raise ValueError(f"encoding_list[{i}] is not a 128-D numpy array")
+            if not isinstance(enc, np.ndarray) or enc.shape not in ((128,), (512,)):
+                raise ValueError(f"encoding_list[{i}] is not a 128-D or 512-D numpy array")
 
         # Check capacity
         if face_id not in self._faces and len(self._faces) >= self.MAX_FACES:
