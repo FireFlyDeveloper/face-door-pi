@@ -30,7 +30,7 @@ from typing import Dict, Optional
 # ── Thresholds (tune empirically) ───────────────────────────────────────
 # Under NoIR, live skin typically has R channel boosted by NIR bleed
 RED_DOMINANCE_MIN = 0.38      # min R/(G+B) ratio for live skin
-RED_EXCESS_MIN = 0.05         # min (2R-G-B)/(R+G+B) normalised excess
+RED_EXCESS_MIN = 0.0          # min (2R-G-B)/(R+G+B) normalised excess
 MIN_FACE_REGION = 100         # minimum face crop pixels
 
 # Debug: print per-frame metrics
@@ -118,7 +118,11 @@ class IRLivenessDetector:
 
         # Combined score: weighted average of normalised metrics
         dom_score = max(0.0, min(1.0, red_dominance / (RED_DOMINANCE_MIN * 1.5)))
-        exc_score = max(0.0, min(1.0, red_excess / (RED_EXCESS_MIN * 1.5)))
+        # Avoid division by zero when RED_EXCESS_MIN == 0
+        if RED_EXCESS_MIN > 0:
+            exc_score = max(0.0, min(1.0, red_excess / (RED_EXCESS_MIN * 1.5)))
+        else:
+            exc_score = 1.0 if red_excess >= 0 else 0.0
         combined = (dom_score * 0.6) + (exc_score * 0.4)
 
         passed = passed_dominance and passed_excess
