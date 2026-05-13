@@ -95,7 +95,7 @@ class BluetoothServer:
             return
         try:
             message = json.dumps(data_dict) + '\n'
-            self.client_sock.send(message.encode('utf-8'))
+            self.client_sock.sendall(message.encode('utf-8'))
         except Exception as e:
             print(f"[BluetoothServer] Send failed: {e}")
 
