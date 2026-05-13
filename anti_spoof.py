@@ -1,14 +1,15 @@
 """
 anti_spoof.py — Single-frame liveness detection for face anti-spoofing.
 
-Ensemble: MiniFASNet ONNX (weight 0.6) + Gray LBP entropy (weight 0.4).
+Ensemble: MiniFASNet ONNX (weight 0.85) + Gray LBP entropy (weight 0.15).
+LBP is unreliable on NoIR camera (IR flood flips entropy direction), so
+ONNX is the primary signal. LBP acts as a minor sanity check only.
 
-Calibrated on NoIR v2 camera (640x480), empirical data:
+Calibrated on NoIR v2 camera (640x480), 2026-05-13:
   Metric            Photo     Live     Gap
-  LBP gray entropy  5.64     6.20     0.56
-  HSV-H entropy     4.97     6.66     1.69  (not used, kept for reference)
-  ONNX index 2      0.84     0.41     0.43
-  ONNX inverted     0.16     0.59     0.43
+  ONNX idx2         0.8485    0.3522   0.4963  ← reliable
+  ONNX inverted     0.1515    0.6478   0.4963
+  LBP gray entropy  6.2911    5.3504   -0.9407 ← flips with lighting
 
 Reference:
   Boulkenafet et al. (2016) — Color LBP anti-spoofing.
@@ -29,16 +30,20 @@ ONNX_MODEL = "./models/minifasnet_v2.onnx"
 ONNX_INPUT_SIZE = (80, 80)
 
 # ── Ensemble weights ────────────────────────────
-ONNX_WEIGHT = 0.6
-LBP_WEIGHT = 0.4
+# ONNX is the primary signal on NoIR camera (LBP flips with IR)
+ONNX_WEIGHT = 0.85
+LBP_WEIGHT = 0.15
 
 # ── LBP thresholds ──────────────────────────────
-# NoIR: HIGHER entropy = LIVE (matches classical LBP theory)
-LBP_THRESHOLD = 5.92     # midpoint between photo(5.64) and live(6.20)
+# NoIR: LBP entropy is unreliable (direction flips with IR lighting)
+# Used as minor sanity check only (15% weight)
+LBP_THRESHOLD = 5.82     # midpoint from latest calibration
 LBP_MARGIN = 0.60        # maps (entropy - threshold) / margin to [0,1]
 
 # ── Final threshold ─────────────────────────────
-SCORE_THRESHOLD = 0.90
+# ONNX_inv midpoint: (0.1515 + 0.6478) / 2 = 0.3996 ≈ 0.40
+# With 85/15 ensemble, photo ≈ 0.13, live ≈ 0.55 → threshold 0.35 works
+SCORE_THRESHOLD = 0.35
 
 
 class AntiSpoofDetector:
