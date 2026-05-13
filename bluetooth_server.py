@@ -158,6 +158,9 @@ class BluetoothServer:
             self._recv_buffer = ""
             return None
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            # EAGAIN = non-blocking poll, no data yet — don't disconnect!
+            if isinstance(e, OSError) and e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return None
             print(f"[BluetoothServer] Connection error during receive: {e}")
             self._recv_buffer = ""
             self.disconnect_client()
