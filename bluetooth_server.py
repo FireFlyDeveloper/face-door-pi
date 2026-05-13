@@ -76,7 +76,7 @@ class BluetoothServer:
             self.client_sock, self.client_address = self.server_sock.accept()
             print(f"[BluetoothServer] Client connected: {self.client_address}")
             return True
-        except socket.timeout:
+        except (socket.timeout, BlockingIOError):
             return False
         except Exception as e:
             print(f"[BluetoothServer] Accept failed: {e}")
