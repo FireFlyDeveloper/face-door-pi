@@ -41,9 +41,9 @@ LBP_THRESHOLD = 5.82     # midpoint from latest calibration
 LBP_MARGIN = 0.60        # maps (entropy - threshold) / margin to [0,1]
 
 # ── Final threshold ─────────────────────────────
-# ONNX_inv midpoint: (0.1515 + 0.6478) / 2 = 0.3996 ≈ 0.40
-# With 85/15 ensemble, photo ≈ 0.13, live ≈ 0.55 → threshold 0.35 works
-SCORE_THRESHOLD = 0.35
+# Calibrated 2026-05-13: photo=0.14, live=0.43 @ ONNX 85%/LBP 15%
+# Midpoint between photo and live ensemble scores ≈ 0.25
+SCORE_THRESHOLD = 0.25
 
 
 class AntiSpoofDetector:
