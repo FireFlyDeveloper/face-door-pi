@@ -4,6 +4,7 @@ Uses PyBluez (python3-bluez) for RFCOMM communication.
 Protocol: each message is a complete JSON object terminated by newline.
 """
 
+import errno
 import json
 import socket
 
@@ -77,6 +78,12 @@ class BluetoothServer:
             print(f"[BluetoothServer] Client connected: {self.client_address}")
             return True
         except (socket.timeout, BlockingIOError):
+            return False
+        except OSError as e:
+            # PyBluez can raise OSError/BluetoothError with EAGAIN on poll
+            if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return False
+            print(f"[BluetoothServer] Accept error: {e}")
             return False
         except Exception as e:
             print(f"[BluetoothServer] Accept failed: {e}")
