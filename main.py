@@ -16,6 +16,7 @@ import io
 import numpy as np
 from PIL import Image
 import cv2
+from typing import Dict, List, Optional
 
 # Ensure project directory is on path for sibling module imports
 PROJECT_DIR = '/home/admin/face-door-system'
@@ -91,6 +92,9 @@ class FaceDoorSystem:
 
         # Persistent lock state (software tracking for UI)
         self._lock_state = "locked"  # "locked" | "unlocked"
+
+        # Pending multi-step registration encodings
+        self._pending_encodings: Dict[str, List[np.ndarray]] = {}
 
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -253,43 +257,57 @@ class FaceDoorSystem:
         if action == 'PING':
             return {'status': 'OK', 'response': 'pong'}
 
-        elif action == 'REGISTER':
+        elif action == 'REGISTER_IMAGE':
             face_id = command.get('face_id', '')
-            images_b64 = command.get('images', [])
-            if not face_id or not images_b64:
-                return {'status': 'ERROR', 'message': 'Missing face_id or images'}
+            image_b64 = command.get('image', '')
+            if not face_id or not image_b64:
+                return {'status': 'ERROR', 'message': 'Missing face_id or image'}
 
             if self.face_storage.get_face_count() >= FaceStorage.MAX_FACES:
                 return {'status': 'ERROR', 'message': f'Maximum {FaceStorage.MAX_FACES} faces reached'}
 
             try:
-                images = [self._b64_to_bgr(b64) for b64 in images_b64]
+                img = self._b64_to_bgr(image_b64)
+                result = self.face_recognizer.get_face_encoding(img)
+                if result is not None:
+                    enc, _ = result
+                    if face_id not in self._pending_encodings:
+                        self._pending_encodings[face_id] = []
+                    self._pending_encodings[face_id].append(enc)
+                    idx = len(self._pending_encodings[face_id])
+                    print(f"[BT]   Image {idx}/10 for {face_id}")
+                    return {'status': 'OK', 'index': idx, 'total': 10}
+                else:
+                    return {'status': 'ERROR', 'message': 'No face detected in image'}
+            except Exception as e:
+                print(f"[BT] REGISTER_IMAGE error: {e}")
+                traceback.print_exc()
+                return {'status': 'ERROR', 'message': str(e)}
 
-                # Register face: get averaged ArcFace 512-D encoding
-                avg_encoding = self.face_recognizer.register_face(images)
-                if avg_encoding is None:
-                    return {'status': 'ERROR', 'message': 'No face detected in any image'}
+        elif action == 'REGISTER_FINALIZE':
+            face_id = command.get('face_id', '')
+            if not face_id:
+                return {'status': 'ERROR', 'message': 'Missing face_id'}
 
-                # Collect all individual encodings for storage
-                all_encodings = []
-                for img in images:
-                    result = self.face_recognizer.get_face_encoding(img)
-                    if result is not None:
-                        enc, _ = result
-                        all_encodings.append(enc)
-                    else:
-                        all_encodings.append(avg_encoding)  # fallback
+            try:
+                encodings = self._pending_encodings.pop(face_id, [])
+                if not encodings:
+                    return {'status': 'ERROR', 'message': 'No images registered for this face'}
 
-                # Pad to exactly 10
+                # Average all encodings
+                avg = np.mean(encodings, axis=0)
+                avg = avg / (np.linalg.norm(avg) + 1e-6)
+
+                # Pad to exactly 10 for storage
+                all_encodings = encodings[:]
                 while len(all_encodings) < 10:
-                    all_encodings.append(avg_encoding)
+                    all_encodings.append(avg)
 
                 self.face_storage.add_face(face_id, all_encodings[:10])
-                print(f"[BT] Registered face: {face_id}")
+                print(f"[BT] Registered face: {face_id} ({len(encodings)} images)")
                 return {'status': 'OK', 'message': f'Face {face_id} registered'}
-
             except Exception as e:
-                print(f"[BT] Registration error: {e}")
+                print(f"[BT] REGISTER_FINALIZE error: {e}")
                 traceback.print_exc()
                 return {'status': 'ERROR', 'message': str(e)}
 
